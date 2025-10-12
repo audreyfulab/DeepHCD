@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from typing import Optional, List, Literal, Any, Tuple
 import numpy as np
 from deephcd.utils.utilities import get_layered_performance, trace_comms
@@ -261,7 +262,7 @@ def evaluate(
     k: int,
     true_labels: Optional[List[torch.Tensor]] = None,
     run_eval: bool = True,
-    device: str = "cpu"
+    device: torch.device | str = 'cpu'
 ) -> Tuple[
     Optional[List[torch.Tensor]], 
     Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[List[torch.Tensor]], Optional[List[torch.Tensor]], Optional[List[torch.Tensor]], Optional[List[torch.Tensor]], Optional[List[torch.Tensor]]], 
@@ -396,3 +397,52 @@ def modularity(A: torch.Tensor, P: torch.Tensor, res: Optional[float] = 1.0) -> 
     B = A - res*(torch.outer(r,r) / n)
     modularity = torch.trace(torch.mm(P.T, torch.mm(B, P)))/(n)
     return modularity
+
+
+#====================================================================================
+# within cluster loss computed using input feature matrix
+#====================================================================================
+def wcss(X: torch.Tensor, Plist: List[torch.Tensor], method: Literal['bottom_up', 'top_down']):
+    
+    """
+    Computes Hierarchical Within-Cluster Sum of Squares
+    X: node feature matrix N nodes by q features
+    P: assignment probabilities for assigning N nodes to k clusters
+    k: number of clusters
+    """
+    if method == 'bottom_up':
+        P = torch.linalg.multi_dot(Plist)
+    else:
+        P = Plist
+        
+    N = X.shape[0]
+    oneN = torch.ones(N, 1)
+    M = torch.mm(torch.mm(X.T, P), torch.diag(1/torch.mm(oneN.T, P).flatten()))
+    D = X.T - torch.mm(M, P.T)
+    MSW = torch.sum(torch.sqrt(torch.diag(torch.mm(D.T, D))))
+    return MSW, M
+
+
+#====================================================================================
+#This function computes the between cluster sum of squares for features X given with predicted labels 
+#====================================================================================
+def bcss(X: torch.Tensor, cluster_centroids: torch.Tensor, numclusts: int, norm_degree: int = 2,
+         weight_by: str = ['kmeans','anova']):
+    """
+    X: node attribute matrix
+    cluster_centroids: the centroids corresponding to a set of identified clusters
+                       in X
+    numclusts: number of inferred clusters in X
+    norm_degree: the norm used to compute the distance
+    weight_by: weighting scheme
+    """
+    #X_tensor = torch.tensor(X, requires_grad=True)
+    supreme_centroid = torch.mean(X, dim = 0)
+    pdist = nn.PairwiseDistance(p=norm_degree)
+    if weight_by == 'kmeans':
+        BCSS_mean_distance = torch.mean(pdist(cluster_centroids, supreme_centroid))
+    else:
+        BCSS_mean_distance = (1/(numclusts - 1))*torch.sum(pdist(cluster_centroids, supreme_centroid))
+    
+    
+    return BCSS_mean_distance

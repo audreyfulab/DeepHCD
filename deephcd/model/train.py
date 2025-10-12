@@ -332,7 +332,7 @@ class OptimizedModularityLoss(nn.Module):
             resolution = resolutions[index] if resolutions else 1.0
             
             with memory_efficient_context():
-                mod = Modularity(A, P, resolution)
+                mod = modularity(A, P, resolution)
                 loss += mod
                 loss_list.append(float(mod.detach().cpu().numpy()))
                 
@@ -363,7 +363,7 @@ class OptimizedClusterLoss(nn.Module):
                 ptensor_list = P
                 
             with memory_efficient_context():
-                within_ss, centroids = WCSS(X=Attr, Plist=ptensor_list, method=method)
+                within_ss, centroids = wcss(X=Attr, Plist=ptensor_list, method=method)
                 
                 weight = Lamb[idx] if isinstance(Lamb, list) else Lamb
                 weighted_loss = weight * within_ss
@@ -431,8 +431,19 @@ class Trainer():
     output_path : str, optional (default='')
         Directory path for saving model output, if enabled.
         Node size for graph visualizations.
+    use_logging : bool, optional (default=True)
+        Enables or disables logging during training.
+        - True: logging is active.
+        - False: logging statements are ignored.
+    log_to_file : bool, optional (default=True)
+        Determines if logs should be saved to a file in addition to the console.
+        - True: logs are written to a file at `output_path`.
+        - False: logs appear only in the console.
+    loglevel : str, optional (default='INFO')
+        Minimum log level to record. Only messages at or above this level are shown.
+        Accepted values: 'CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG', 'NOTSET'.
     verbose : bool, optional (default=True)
-        Whether to print detailed logs and progress updates during training.
+        Whether to print detailed logs and progress updates to the console during training.
     **kwargs : dict
         Additional keyword arguments for customizing training behavior.
 
@@ -495,7 +506,10 @@ class Trainer():
                 validation_data: Optional[Dict[str, torch.Tensor]]=None, 
                 test_data: Optional[Dict[str, torch.Tensor]]=None, 
                 save_output: Optional[bool]=False, 
-                output_path='./save/path/to/output', 
+                output_path: Optional[str]=None, 
+                use_logging: Optional[bool]=True,
+                log_to_file: Optional[bool]=True,
+                loglevel: Optional[str]='INFO',
                 verbose: Optional[bool]=True, 
                 ):
         """
@@ -533,6 +547,34 @@ class Trainer():
         self.save_output = save_output
         self.output_path = output_path
         self.verbose = verbose
+        
+        #set up logger
+        if use_logging:
+            if log_to_file:
+                logpath = os.path.join(output_path, 'logfile.txt')
+            try:
+                self.logger = logging_config(logger_name="trainer",
+                                            loglevel=loglevel,
+                                            log_to_file=log_to_file,
+                                            file_path=logpath)
+            except Exception as e:
+                raise Exception(f'Failed to retreive logger! {e}')
+        else:
+            self.logger = None
+            
+        # set up output directory
+        if self.save_output:
+            if not os.path.exists(self.output_path):
+                try:
+                    if self.logger:
+                        self.logger.info(f'Creating output directory: {self.output_path}')
+                    else:
+                        print(f'Creating output directory: {self.output_path}')
+                    #make directory
+                    os.makedirs(self.output_path, exist_ok=True)
+                except Exception as e:
+                    raise Exception(f'Error! Failed to create output directory: {e}')
+            
 
         # Initialize memory-efficient histories (stored on CPU only)
         self.train_loss_history: List[Dict[str, float]] = []
@@ -543,13 +585,85 @@ class Trainer():
         # Placeholder for batch indices (generated once, CPU)
         self.batch_indices_list: Optional[List[torch.Tensor | np.ndarray]] = None
         
+    # basic wrapper for logging/printing
+    def logprint(self, _string: str):
+        """"""
+        if self.logger:
+            self.logger.info(_string)
+        else:
+            if self.verbose:
+                print(_string)
+                
+    #wrapper for printing performances
+    def print_performance(self, history: Dict, comm_layers: List[torch.Tensor | np.ndarray], k: int):
+        """bulk printing with error handling"""
+        
+        if not history or all(h is None for h in history):
+            self.logprint("No performance history available")
+            return
+
+        valid_history = [h for h in history if h is not None]
+        if not valid_history:
+            self.logprint("No valid performance data available")
+            return
+
+        last_perf = valid_history[-1]
+        layer_names = ['top'] + [f'middle_{i}' for i in range(comm_layers-1)]
+        
+        for i in range(min(k, len(last_perf))):
+            if i >= len(last_perf) or last_perf[i] is None:
+                self.logprint(f"No data available for {layer_names[i]} layer")
+                continue
+                
+            self.logprint(f'{"-"*20} {layer_names[i]} layer {"-"*20}')
+            
+            metrics = last_perf[i]
+            metric_names = ['Homogeneity', 'Completeness', 'NMI', 'ARI']
+            
+            for j, (name, value) in enumerate(zip(metric_names, metrics[:4])):
+                self.logprint(f'{name}: {value:.4f}')
+            self.logprint('-' * 50)
+            
+    @staticmethod
+    def get_mod_clust_losses(model: nn.Module, 
+                             Xbatch: torch.Tensor, 
+                             Abatch: torch.Tensor, 
+                             output: List | Tuple, 
+                             lamb: float | int | torch.Tensor, 
+                             resolution: List[float | int], 
+                             modlossfn: nn.Module, 
+                             clustlossfn: nn.Module
+                             ):
+        
+        """Optimized loss computation with memory management"""
+        X_hat, A_hat, A_logit, X_all, A_all, P_all, S_all, AW = output
+        
+        if model.method == 'bottom_up':
+            S_sub, S_relab, S = trace_comms([s.clone() for s in S_all], model.comm_sizes)
+            Mod_loss, Modloss_values = modlossfn([Abatch] + A_all[1], P_all, resolution)
+            Clust_loss, Clustloss_values = clustlossfn(lamb, Xbatch, P_all, model.method)
+        elif model.method == "top_down":
+            # Top-down processing
+            top_mod_loss, values_top = modlossfn([A_all[0]], [P_all[0]], resolution)
+            middle_mod_loss, values_mid = modlossfn(A_all[-1], P_all[1], resolution)
+            Mod_loss = top_mod_loss + middle_mod_loss
+            Modloss_values = values_top + [torch.mean(torch.tensor(values_mid)).item()]
+            
+            Clust_loss_top, Clustloss_values_top = clustlossfn(lamb[0], Xbatch, [P_all[0]], model.method)
+            Clust_loss_mid, Clustloss_values_mid = clustlossfn(lamb[1], X_all[-1], P_all[1], model.method)
+            Clust_loss = Clust_loss_top + Clust_loss_mid
+            Clustloss_values = Clustloss_values_top + [torch.sum(torch.tensor(Clustloss_values_mid)).item()]
+        
+        return Mod_loss, Modloss_values, Clust_loss, Clustloss_values
+            
+    # fits model to data 
     def fit(self, device: torch.device):
         """
         Optimized training function with memory efficiency improvements
         """
         
         # Move model to device
-        model = model.to(device)
+        model = self.model.to(device)
         
         # Initialize storage with minimal memory footprint
         train_loss_history = []
@@ -580,11 +694,11 @@ class Trainer():
         if self.use_batch_learning:
             if self.batch_size > self.X.shape[0]:
                 raise ValueError(f'Batch size ({self.batch_size}) larger than dataset size ({self.X.shape[0]})')
-            self.batch_indices_list = get_efficient_batches(X, A, self.batch_size, device='cpu')
+            self.batch_indices_list = get_efficient_batches(self.X, self.A, self.batch_size, device='cpu')
         else:
             self.batch_indices_list = [torch.arange(self.X.shape[0])]
         
-        print(f"Training on {len(batch_indices_list)} batches")
+        self.logprint(f"Training on {len(self.batch_indices_list)} batches")
         
         # Training loop
         for epoch in range(self.epochs):
@@ -599,15 +713,16 @@ class Trainer():
                 'mod': [0.0] * len(model.comm_sizes)
             }
             
-            print(f'Epoch {epoch + 1}/{epochs}')
-            print('=' * 50)
+            self.logprint(f'Epoch {epoch + 1}/{self.epochs}')
+            self.logprint('=' * 50)
             
             # Batch processing with memory management
-            for batch_idx, batch_indices in enumerate(batch_indices_list):
+            for batch_idx, batch_indices in enumerate(self.batch_indices_list):
+                
+                
                 with memory_efficient_context():
                     # Get batch data on device
-                    A = A / A.max()
-                    X_batch, A_batch = get_batch_data(X, A, batch_indices, device)
+                    X_batch, A_batch = get_batch_data(self.X, self.A, batch_indices, device)
                     
                     optimizer.zero_grad()
                     
@@ -616,9 +731,9 @@ class Trainer():
                     X_hat, A_hat, A_logit, X_all, A_all, P_all, S_all, AW = forward_output
                     
                     # Compute losses efficiently
-                    mod_clust_output = get_optimized_losses(
-                        model, X_batch, A_batch, forward_output, lamb, 
-                        layer_resolutions, modularity_loss_fn, clustering_loss_fn
+                    mod_clust_output = self.get_mod_clust_losses(
+                        model, X_batch, A_batch, forward_output, self._lambda, 
+                        self.graph_resolutions, modularity_loss_fn, clustering_loss_fn
                     )
                     Mod_loss, Modloss_values, Clust_loss, Clustloss_values = mod_clust_output
                     
@@ -629,8 +744,8 @@ class Trainer():
                     A_loss = A_recon_loss(A_hat, A_batch)
                     
                     # Total loss
-                    batch_loss = A_loss + gamma * X_loss + Clust_loss - delta * Mod_loss
-                    print(f'A_loss: ',A_loss,', X_loss: ',X_loss,', Clust_loss',Clust_loss,', Mod_loss: ',Mod_loss)
+                    batch_loss = A_loss + self.gamma * X_loss + Clust_loss - self.delta * Mod_loss
+                    self.logprint(f'A_loss: {A_loss} X_loss: {X_loss} Clust_loss: {Clust_loss} Mod_loss: {Mod_loss}')
                     # Backward pass
                     batch_loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -638,7 +753,7 @@ class Trainer():
                     
                     # Update epoch losses
                     total_loss += batch_loss.item()
-                    print(f'batch loss: ',batch_loss.item())
+                    self.logprint(f'batch loss: ',batch_loss.item())
                     train_epoch_losses['A'] += A_loss.item()
                     train_epoch_losses['X'] += X_loss.item()
                     
@@ -656,18 +771,18 @@ class Trainer():
             train_loss_history.append({
                 'Total Loss': total_loss,
                 'A Reconstruction': train_epoch_losses['A'],
-                'X Reconstruction': gamma * train_epoch_losses['X'],
-                'Modularity': delta * np.array(train_epoch_losses['mod']),
+                'X Reconstruction': self.gamma * train_epoch_losses['X'],
+                'Modularity': self.delta * np.array(train_epoch_losses['mod']),
                 'Clustering': np.array(train_epoch_losses['clust'])
             })
             
             # Evaluation (less frequent to save memory)
             test_loss = 0.0
-            if test_data:
-                eval_X, eval_A, eval_labels = test_data
+            if self.test_data:
+                eval_X, eval_A, eval_labels = self.test_data
                 with memory_efficient_context():
-                    test_perf, test_output, S_replab_test = evaluate_efficient(
-                        model, eval_X, eval_A, k, eval_labels, device=device
+                    test_perf, test_output, S_replab_test = evaluate(
+                        model, eval_X, eval_A, self.k, eval_labels, device=device
                     )
                     
                     if test_output[0] is not None:
@@ -679,49 +794,49 @@ class Trainer():
                         
                         X_loss_test = X_recon_loss(X_hat_dev, eval_X_dev).item()
                         A_loss_test = A_recon_loss(A_hat_dev, eval_A_dev).item()
-                        print(A_hat)
-                        test_loss = A_loss_test + gamma * X_loss_test
+                        test_loss = A_loss_test + self.gamma * X_loss_test
                         
             
             test_loss_history.append({'Total Loss': test_loss})
             
             # Performance evaluation (periodic)
-            if epoch % update_interval == 0:
+            if epoch % self.update_interval == 0:
                 with memory_efficient_context():
-                    train_perf, eval_output, S_eval = evaluate_efficient(
-                        model, X, A, k, true_labels, device=device
+                    train_perf, eval_output, S_eval = evaluate(
+                        model, self.X, self.A, self.k, self.true_labels, device=device
                     )
                     perf_hist.append(train_perf)
                     pred_list.append(S_eval)
                     
-                    if true_labels:
-                        print('\nMODEL PERFORMANCE')
-                        print_performance_efficient(perf_hist, comm_layers, k)
+                    if self.true_labels:
+                        self.logprint('\nMODEL PERFORMANCE')
+                        self.print_performance(perf_hist, comm_layers, k)
             
             # Early stopping check
-            if early_stopping:
-                print('Early Stopping Start\n')
-                print(f'A_loss_test: ',A_loss_test, ', X_loss_test: ', X_loss_test)
-                print(f'Total Loss: ',  total_loss)
-                print(f'Test Loss: ', test_loss)
+            if self.early_stopping:
+                self.logprint(f"""Early Stopping Start:
+                              A_loss_test: {A_loss_test} 
+                              X_loss_test: {X_loss_test}
+                              Total Loss: {total_loss}
+                              Test Loss: {test_loss}
+                              """)
             
-                early_stop(test_loss if test_data else total_loss, model)
+                early_stop(test_loss if self.test_data else total_loss, model)
                 if early_stop.early_stop:
-                    print("Early stopping triggered")
+                    self.logprint("Early stopping triggered")
                     break
             
             epoch_time = time.time() - epoch_start
-            if verbose:
-                print(f'Epoch {epoch + 1} completed in {epoch_time:.2f}s')
-                print(f'Total Loss: {total_loss:.4f}')
-                print('-' * 50)
+            if self.verbose:
+                self.logprint(f'Epoch {epoch + 1} completed in {epoch_time:.2f}s Total Loss: {total_loss:.4f}')
+                self.logprint('-' * 50)
         
         # Final model output
-        print("Generating final output...")
+        self.logprint("Generating final output...")
         with memory_efficient_context():
             model.eval()
             with torch.no_grad():
-                final_out = model.forward(X.to(device), A.to(device))
+                final_out = model.forward(self.X.to(device), self.A.to(device))
                 # Move to CPU immediately
                 final_out_cpu = []
                 for item in final_out:
@@ -732,62 +847,16 @@ class Trainer():
                     else:
                         final_out_cpu.append(item)
         
-        # Create optimized output object
+        # Create output object
         output = HCD_output(
-            X=X, A=A, test_set=test_data, labels=true_labels,
+            X=self.X, A=self.A, test_set=self.test_data, labels=self.true_labels,
             model_output=final_out_cpu, train_history=train_loss_history,
             test_history=test_loss_history, perf_history=perf_hist,
-            pred_history=pred_list, batch_indices=batch_indices_list, device='cpu'
+            pred_history=pred_list, batch_indices=self.batch_indices_list, device='cpu'
         )
         
         return output
 
-    def get_optimized_losses(model, Xbatch, Abatch, output, lamb, resolution, modlossfn, clustlossfn):
-        """Optimized loss computation with memory management"""
-        X_hat, A_hat, A_logit, X_all, A_all, P_all, S_all, AW = output
-        
-        if model.method == 'bottom_up':
-            S_sub, S_relab, S = trace_comms([s.clone() for s in S_all], model.comm_sizes)
-            Mod_loss, Modloss_values = modlossfn([Abatch] + A_all[1], P_all, resolution)
-            Clust_loss, Clustloss_values = clustlossfn(lamb, Xbatch, P_all, model.method)
-        elif model.method == "top_down":
-            # Top-down processing
-            top_mod_loss, values_top = modlossfn([A_all[0]], [P_all[0]], resolution)
-            middle_mod_loss, values_mid = modlossfn(A_all[-1], P_all[1], resolution)
-            Mod_loss = top_mod_loss + middle_mod_loss
-            Modloss_values = values_top + [torch.mean(torch.tensor(values_mid)).item()]
-            
-            Clust_loss_top, Clustloss_values_top = clustlossfn(lamb[0], Xbatch, [P_all[0]], model.method)
-            Clust_loss_mid, Clustloss_values_mid = clustlossfn(lamb[1], X_all[-1], P_all[1], model.method)
-            Clust_loss = Clust_loss_top + Clust_loss_mid
-            Clustloss_values = Clustloss_values_top + [torch.sum(torch.tensor(Clustloss_values_mid)).item()]
-        
-        return Mod_loss, Modloss_values, Clust_loss, Clustloss_values
+    
 
-    def print_performance_efficient(history, comm_layers, k):
-        """Efficient performance printing with error handling"""
-        if not history or all(h is None for h in history):
-            print("No performance history available")
-            return
-
-        valid_history = [h for h in history if h is not None]
-        if not valid_history:
-            print("No valid performance data available")
-            return
-
-        last_perf = valid_history[-1]
-        layer_names = ['top'] + [f'middle_{i}' for i in range(comm_layers-1)]
-        
-        for i in range(min(k, len(last_perf))):
-            if i >= len(last_perf) or last_perf[i] is None:
-                print(f"No data available for {layer_names[i]} layer")
-                continue
-                
-            print(f'{"-"*20} {layer_names[i]} layer {"-"*20}')
-            
-            metrics = last_perf[i]
-            metric_names = ['Homogeneity', 'Completeness', 'NMI', 'ARI']
-            
-            for j, (name, value) in enumerate(zip(metric_names, metrics[:4])):
-                print(f'{name}: {value:.4f}')
-            print('-' * 50)
+    
