@@ -2,7 +2,7 @@
 name = "deephcd"
 version = "0.1"
 description = "deephcd created by audreyfulab"
-requires-python = ">=3.12,<4.0"
+requires-python = ">=3.13,<4.0"
 authors = [
     { name = "Jarred Kvamme", email = "jarredk@uidaho.edu" }
 ]
