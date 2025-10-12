@@ -5,7 +5,6 @@ import time
 import torch.optim as optimizers 
 from deephcd.utils.utilities import logging_config, trace_comms
 from deephcd.utils.train_utils import get_batch_data, get_efficient_batches, evaluate, memory_efficient_context, load_batch_output, modularity, wcss
-from deephcd.utils.plot_utils import plot_loss, plot_perf, plot_nodes, plot_clust_heatmaps
 import os
 from typing import Optional, Union, List, Literal, Dict, Any, Tuple
 
