@@ -1,0 +1,112 @@
+[project]
+name = "deephcd"
+version = "0.1"
+description = "deephcd created by audreyfulab"
+requires-python = ">=3.12,<4.0"
+authors = [
+    { name = "Jarred Kvamme", email = "jarredk@uidaho.edu" }
+]
+
+# ✅ Core dependencies for FastAPI stack
+dependencies = [
+    "jinja2>=3.1.4", # for templating if needed
+    "setuptools>=75.8.0",
+    "requests>=2.32.5",
+    "openai>=2.2.0",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+    "torchaudio>=2.8.0",
+    "scipy>=1.16.2",
+    "scikit-learn>=1.7.2",
+    "networkx>=3.5",
+    "python-louvain>=0.16",
+    "plotly>=6.3.1",
+    "seaborn>=0.13.2",
+    "colorama>=0.4.6",
+    "torch-geometric>=2.6.1",
+    "numpy>=2.3.3",
+    "pandas>=2.3.3",
+    "matplotlib>=3.10.7",
+    "torchinfo>=1.8.0",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["deephcd"]
+include = []
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu126"
+
+
+[project.urls]
+"Homepage" = "https://github.com/audreyfulab/deephcd"
+# "Documentation" = "https://github.com/audreyfulab/deephcd"
+
+# ✅ Optional dependencies organized into logical groups
+[tool.uv]
+default-groups = ["dev", "test", "lint"]
+
+[dependency-groups]
+dev = [
+    "tox>=4.23.2",
+    "tox-uv>=1.26.0",
+    "uv>=0.7.11",
+]
+
+test = [
+    "pytest>=8.3.4",
+    "pytest-cov>=6.1.1",
+    "httpx>=0.27.2",  # for API testing
+]
+
+lint = [
+    "mypy>=1.14.1",
+    "ruff>=0.9.1",
+    "black>=24.8.0",
+    "isort>=5.13.2",
+]
+
+[tool.pytest.ini_options]
+addopts = "--cov=deephcd --cov-report xml"
+
+[tool.tox]
+requires = ["tox-uv", "uv"]
+env_list = ["format", "lint", "type", "3.13"]
+
+[tool.tox.env.format]
+description = "Format the code with Ruff"
+dependency_groups = ["lint"]
+skip_install = true
+commands = [["ruff", "format"]]
+
+[tool.tox.env.lint]
+description = "Lint the code with Ruff"
+dependency_groups = ["lint"]
+skip_install = true
+commands = [["ruff", "check"]]
+
+[tool.tox.env.type]
+description = "Analyze the code with mypy"
+dependency_groups = ["lint"]
+commands = [["mypy", "deephcd"]]
+
+[tool.tox.env.3.13]
+dependency_groups = ["coverage", "test", "dev"]
+commands = [["pytest", "tests", "{posargs}"]]
+description = "Run pytest in a virtual environment and collect coverage"
+
+[tool.mypy]
+follow_imports = "silent"
+ignore_missing_imports = true
+python_version = "3.13"
+strict_optional = false
+
+[tool.tox.gh.python]
+"3.13" = ["3.13", "format", "lint", "mypy"]
+
+[build-system]
+requires = ["setuptools", "cython"]
+build-backend = "setuptools.build_meta"
