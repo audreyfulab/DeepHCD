@@ -1,7 +1,7 @@
 
 # Deep learning based Hierarchical Community Detection (DeepHCD) with graph embedding
 
-![](HCD_logo_1.jpg).
+![](./static/images/HCD_logo_1.jpg).
 This image was generated with Dall-E 3
 
 ## About
