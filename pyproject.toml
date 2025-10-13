@@ -3,6 +3,8 @@ name = "deephcd"
 version = "0.1"
 description = "deephcd created by audreyfulab"
 requires-python = ">=3.13,<4.0"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE*"]
 authors = [
     { name = "Jarred Kvamme", email = "jarredk@uidaho.edu" }
 ]
@@ -28,6 +30,7 @@ dependencies = [
     "pandas>=2.3.3",
     "matplotlib>=3.10.7",
     "torchinfo>=1.8.0",
+    "torch-kmeans>=0.2.0",
 ]
 
 [tool.setuptools]
@@ -43,7 +46,7 @@ url = "https://download.pytorch.org/whl/cu126"
 
 [project.urls]
 "Homepage" = "https://github.com/audreyfulab/deephcd"
-# "Documentation" = "https://github.com/audreyfulab/deephcd"
+"Issues" = "https://github.com/audreyfulab/deephcd/issues"
 
 # ✅ Optional dependencies organized into logical groups
 [tool.uv]

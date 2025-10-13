@@ -3,12 +3,10 @@ import pandas as pd
 import networkx as nx
 import seaborn as sbn
 import matplotlib.pyplot as plt
-from simulation_software.HGRN_hierarchicalgraph import hierachical_graph 
-from simulation_software.HGRN_hierarchicalgraph import generate_pseudo_expression, generate_pseudo_expression_weighted
-from simulation_software.HGRN_hierarchicalgraph import same_cluster
-from simulation_software.simulation_utilities import plot_diGraph
-from model.utilities import pickle_data, sort_labels
-import random as rd  
+from deephcd.simulate.graph import hierachical_graph, generate_pseudo_expression, generate_pseudo_expression_weighted
+from deephcd.utils.simulation_utils import plot_diGraph
+from deephcd.utils.utilities import pickle_data, sort_labels
+import random as rd 
 import time
 
 
