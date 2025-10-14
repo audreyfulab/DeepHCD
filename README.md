@@ -5,7 +5,7 @@
 This image was generated with Dall-E 3
 
 ## About
-Code developement repo for Hierarchical Community Detection (HCD): A graph-based deep learning algorithm for detecting community structure in gene regulatory networks from gene expression data.
+Production code repo for the DeepHCD library
 
 ## Instructions to install DeepHCD 
 
