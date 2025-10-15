@@ -4,7 +4,6 @@ version = "0.1"
 description = "deephcd created by audreyfulab"
 requires-python = ">=3.13,<4.0"
 license = "GPL-3.0-or-later"
-license-files = ["LICENSE*"]
 authors = [
     { name = "Jarred Kvamme", email = "jarredk@uidaho.edu" }
 ]
@@ -34,11 +33,12 @@ dependencies = [
 ]
 
 [tool.setuptools]
+license-files = ["LICENSE*"]
 include-package-data = true
 
 [tool.setuptools.packages.find]
-where = ["deephcd"]
-include = []
+where = ["."]
+include = ["deephcd*"]
 
 [[tool.uv.index]]
 url = "https://download.pytorch.org/whl/cu126"
