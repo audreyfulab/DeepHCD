@@ -5,7 +5,7 @@ description = "deephcd created by audreyfulab"
 requires-python = ">=3.13,<4.0"
 license = "GPL-3.0-or-later"
 authors = [
-    { name = "Jarred Kvamme", email = "jarredk@uidaho.edu" }
+    { name = "Jarred Kvamme", email = "jarredk@uidaho.edu" },
     { name = "Jordan Davis", email = "jgd45@njit.edu"}
 ]
 
