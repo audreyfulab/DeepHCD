@@ -326,9 +326,9 @@ class OptimizedModularityLoss(nn.Module):
     def forward(self, all_A, all_P, resolutions=None):
         loss = 0.0
         loss_list = []
-        
+
         for index, (A, P) in enumerate(zip(all_A, all_P)):
-            resolution = resolutions[index] if resolutions else 1.0
+            resolution = resolutions[index] if (resolutions and index < len(resolutions)) else 1.0
             
             with memory_efficient_context():
                 mod = modularity(A, P, resolution)
@@ -492,10 +492,10 @@ class Trainer():
                 epochs: Optional[int]=50, 
                 update_interval: Optional[int]=10, 
                 learning_rate: Optional[float]=1e-4, 
-                gamma: Optional[int]=1, 
-                delta: Optional[int]=1, 
-                _lambda: Optional[int]=1, 
-                graph_resolutions: Optional[List[int,int,]]=[1,1], 
+                gamma: Optional[int]=1,
+                delta: Optional[int]=1,
+                _lambda: Optional[int | List[int]]=1,
+                graph_resolutions: Optional[List[int]]=[1,1], 
                 k: Optional[int]=2,  
                 batch_size: Optional[int]=64, 
                 early_stopping: Optional[bool]=False, 
@@ -594,7 +594,7 @@ class Trainer():
                 print(_string)
                 
     #wrapper for printing performances
-    def print_performance(self, history: Dict, comm_layers: List[torch.Tensor | np.ndarray], k: int):
+    def print_performance(self, history: Dict, comm_layers: int, k: int):
         """bulk printing with error handling"""
         
         if not history or all(h is None for h in history):
@@ -624,13 +624,13 @@ class Trainer():
             self.logprint('-' * 50)
             
     @staticmethod
-    def get_mod_clust_losses(model: nn.Module, 
-                             Xbatch: torch.Tensor, 
-                             Abatch: torch.Tensor, 
-                             output: List | Tuple, 
-                             lamb: float | int | torch.Tensor, 
-                             resolution: List[float | int], 
-                             modlossfn: nn.Module, 
+    def get_mod_clust_losses(model: nn.Module,
+                             Xbatch: torch.Tensor,
+                             Abatch: torch.Tensor,
+                             output: List | Tuple,
+                             lamb: float | int | List[int | float] | torch.Tensor,
+                             resolution: List[float | int],
+                             modlossfn: nn.Module,
                              clustlossfn: nn.Module
                              ):
         
@@ -647,9 +647,13 @@ class Trainer():
             middle_mod_loss, values_mid = modlossfn(A_all[-1], P_all[1], resolution)
             Mod_loss = top_mod_loss + middle_mod_loss
             Modloss_values = values_top + [torch.mean(torch.tensor(values_mid)).item()]
-            
-            Clust_loss_top, Clustloss_values_top = clustlossfn(lamb[0], Xbatch, [P_all[0]], model.method)
-            Clust_loss_mid, Clustloss_values_mid = clustlossfn(lamb[1], X_all[-1], P_all[1], model.method)
+
+            # Handle lamb as list or scalar
+            lamb_top = lamb[0] if isinstance(lamb, (list, tuple)) else lamb
+            lamb_mid = lamb[1] if isinstance(lamb, (list, tuple)) and len(lamb) > 1 else lamb
+
+            Clust_loss_top, Clustloss_values_top = clustlossfn(lamb_top, Xbatch, [P_all[0]], model.method)
+            Clust_loss_mid, Clustloss_values_mid = clustlossfn(lamb_mid, X_all[-1], P_all[1], model.method)
             Clust_loss = Clust_loss_top + Clust_loss_mid
             Clustloss_values = Clustloss_values_top + [torch.sum(torch.tensor(Clustloss_values_mid)).item()]
         
@@ -693,7 +697,7 @@ class Trainer():
         if self.use_batch_learning:
             if self.batch_size > self.X.shape[0]:
                 raise ValueError(f'Batch size ({self.batch_size}) larger than dataset size ({self.X.shape[0]})')
-            self.batch_indices_list = get_efficient_batches(self.X, self.A, self.batch_size, device='cpu')
+            self.batch_indices_list = get_efficient_batches(self.X, self.batch_size, device='cpu')
         else:
             self.batch_indices_list = [torch.arange(self.X.shape[0])]
         
@@ -752,7 +756,7 @@ class Trainer():
                     
                     # Update epoch losses
                     total_loss += batch_loss.item()
-                    self.logprint(f'batch loss: ',batch_loss.item())
+                    self.logprint(f'batch loss: {batch_loss.item()}')
                     train_epoch_losses['A'] += A_loss.item()
                     train_epoch_losses['X'] += X_loss.item()
                     
@@ -777,6 +781,8 @@ class Trainer():
             
             # Evaluation (less frequent to save memory)
             test_loss = 0.0
+            A_loss_test = 0.0
+            X_loss_test = 0.0
             if self.test_data:
                 eval_X, eval_A, eval_labels = self.test_data
                 with memory_efficient_context():
@@ -819,8 +825,10 @@ class Trainer():
                               Total Loss: {total_loss}
                               Test Loss: {test_loss}
                               """)
-            
-                early_stop(test_loss if self.test_data else total_loss, model)
+
+                loss_value = test_loss if self.test_data else total_loss
+                loss_type = 'test' if self.test_data else 'total'
+                early_stop(loss_value, model, loss_type)
                 if early_stop.early_stop:
                     self.logprint("Early stopping triggered")
                     break

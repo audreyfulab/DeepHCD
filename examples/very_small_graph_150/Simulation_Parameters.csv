@@ -1,0 +1,24 @@
+,Parameter,Value
+0,connect,disc
+1,connect_prob_middle,"[0.11134172087511063, 0.08647795396239144]"
+2,connect_prob_bottom,"[0.013936456449966213, 0.006693567439682701]"
+3,top_layer_nodes,5
+4,subgraph_type,small world
+5,subgraph_prob,"(0.5, 0.2)"
+6,nodes_per_super2,"(1, 1)"
+7,nodes_per_super3,"(4, 9)"
+8,node_degree_middle,3
+9,node_degree_bottom,15
+10,sample_size,500
+11,layers,3
+12,SD,0.1
+13,common_dist,False
+14,use_weighted_graph,False
+15,within_edgeweights,"(0.5, 0.8)"
+16,between_edgeweights,"(0, 0.2)"
+17,set_seed,True
+18,seed_number,555
+19,force_connect,True
+20,savepath,/Users/jordandavis/Desktop/HGRN_repo/very_small_graph_150/
+21,mixed_graph,False
+22,use_multihead_attn,True

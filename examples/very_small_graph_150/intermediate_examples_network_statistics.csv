@@ -1,0 +1,2 @@
+,subgraph_type,connection_type,connection_prob,layers,StDev,nodes_per_layer,edges_per_layer,subgraph_prob,sample_size,modularity_top,avg_node_degree_top,avg_connect_within_top,avg_connect_between_top,modularity_middle,avg_node_degree_middle,avg_connect_within_middle,avg_connect_between_middle
+0,small world,full,"{'middle': [0.008, 0.003], 'bottom': [0.013, 0.0029000000000000002]}",3,0.1,"(3, 15, 150)","(3, 15, 321)","(0.5, 0.2)",500,0.6665890276685983,2.14,107.0,0.0,0.8677274094777809,2.14,20.0,0.1

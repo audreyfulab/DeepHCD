@@ -1,0 +1,11 @@
+connect: full
+nodes_per_super2: (5, 5)
+nodes_per_super3: (10, 10)
+top_layer_nodes: 3
+middle_layer_nodes: 15.0
+bottom_layer_nodes: 150.0
+node_degree_middle: 3
+node_degree_bottom: 5
+connect_prob_middle: [0.008, 0.003]
+connect_prob_bottom: [0.013, 0.0029000000000000002]
+sim_args.subgraph_type: small world

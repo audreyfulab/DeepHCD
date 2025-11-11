@@ -172,7 +172,7 @@ def split_dataset(
     X: torch.Tensor,
     A: torch.Tensor,
     labels: List[torch.Tensor],
-    split: List[float, float] = [0.8, 0.2]
+    split: List[float] = [0.8, 0.2]
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """
     Split a node-level graph dataset into training and testing sets.
@@ -313,7 +313,7 @@ def evaluate(
 
     Example
     -------
-    >>> perf, outputs, relab = evaluate_efficient(model, X, A, k=3, true_labels=labels, device="cuda")
+    >>> perf, outputs, relab = evaluate(model, X, A, k=3, true_labels=labels, device="cuda")
     """
     if not run_eval:
         return None, (None, None, None, None, None, None, None), None

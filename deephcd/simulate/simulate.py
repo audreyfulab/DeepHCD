@@ -66,7 +66,7 @@ def simulate_graph(args):
         if args.seed_number:
             rd.seed(args.seed_number)
         else:
-            rd.seed(rd(100, 1000))
+            rd.seed(rd.randint(100, 1000))
         
         
     
