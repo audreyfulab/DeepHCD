@@ -99,22 +99,23 @@ def simulate_graph(args):
         top_layer_time_end = time.time()
     #for networks with disconnected top layer
     if args.connect == 'disc':
-    
+        top_layer_time_start = time.time()
         h1_graph =  np.zeros((args.top_layer_nodes,args.top_layer_nodes))
         h1_graph = nx.from_numpy_array(h1_graph)
-        
+
         #draw top graph
         #draw directed graph
         fig, ax = plt.subplots(figsize = (14,10))
         topfig = plot_diGraph(fig, ax, h1_graph, return_fig=True)
         topfig.savefig(args.savepath+'top_layer_graph.pdf')
         topfig.savefig(args.savepath+'top_layer_graph.png', dpi = 500)
-        
+
         #sort toplayer
         ts_h1_graph = list(h1_graph.nodes())
         adj_h1_graph = nx.adjacency_matrix(h1_graph, ts_h1_graph).todense()
         h1_in_degree = 0
         h1_out_degree = 0
+        top_layer_time_end = time.time()
         
     #print top layer summary stats
     print('-'*60)
