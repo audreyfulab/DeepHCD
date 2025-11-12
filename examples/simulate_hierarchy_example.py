@@ -142,7 +142,7 @@ def main():
     print(f"  Total data points: {pe.size:,}")
 
     print(f"\nOutput Files Generated:")
-    print(f"  📁 {args.savepath}")
+    print(f"  Directory: {args.savepath}")
     print(f"    ├── top_layer_graph.pdf/png - Top layer network visualization")
     if args.layers == 3:
         print(f"    ├── middle_layer_graph.pdf/png - Middle layer network visualization")

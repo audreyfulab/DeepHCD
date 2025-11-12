@@ -57,7 +57,7 @@ os.makedirs(args.savepath, exist_ok=True)
 print("Simulating hierarchical network...")
 pe, gexp, nodes, edges, nx_all, adj_all, path, labels, ori = simulate_graph(args)
 
-print("\n✅ Simulation complete!")
+print("\nSimulation complete!")
 print(f"   Network: {nodes[0]} → {nodes[1]} → {nodes[2]} nodes")
 print(f"   Data: {pe.shape[0]} nodes × {pe.shape[1]} samples")
 print(f"   Saved to: {args.savepath}")

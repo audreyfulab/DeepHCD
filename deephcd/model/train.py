@@ -815,7 +815,7 @@ class Trainer():
                     
                     if self.true_labels:
                         self.logprint('\nMODEL PERFORMANCE')
-                        self.print_performance(perf_hist, comm_layers, k)
+                        self.print_performance(perf_hist, comm_layers, self.k)
             
             # Early stopping check
             if self.early_stopping:
@@ -859,7 +859,7 @@ class Trainer():
             X=self.X, A=self.A, test_set=self.test_data, labels=self.true_labels,
             model_output=final_out_cpu, train_history=train_loss_history,
             test_history=test_loss_history, perf_history=perf_hist,
-            pred_history=pred_list, batch_indices=self.batch_indices_list, device='cpu'
+            pred_history=pred_list, batch_indices=self.batch_indices_list
         )
         
         return output
