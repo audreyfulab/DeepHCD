@@ -148,22 +148,30 @@ def main():
 
     # Compare with true labels if available
     if sorted_top is not None:
-        from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
+        from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score, homogeneity_score, completeness_score
 
+        homogeneity_top = homogeneity_score(sorted_top, top_labels.numpy())
+        completeness_top = completeness_score(sorted_top, top_labels.numpy())
         nmi_top = normalized_mutual_info_score(sorted_top, top_labels.numpy())
         ari_top = adjusted_rand_score(sorted_top, top_labels.numpy())
 
         print(f"\nComparison with True Labels (Top Layer):")
-        print(f"   NMI: {nmi_top:.4f}")
-        print(f"   ARI: {ari_top:.4f}")
+        print(f"   Homogeneity:  {homogeneity_top:.4f}")
+        print(f"   Completeness: {completeness_top:.4f}")
+        print(f"   NMI:          {nmi_top:.4f}")
+        print(f"   ARI:          {ari_top:.4f}")
 
         if sorted_mid is not None:
+            homogeneity_mid = homogeneity_score(sorted_mid, middle_labels.numpy())
+            completeness_mid = completeness_score(sorted_mid, middle_labels.numpy())
             nmi_mid = normalized_mutual_info_score(sorted_mid, middle_labels.numpy())
             ari_mid = adjusted_rand_score(sorted_mid, middle_labels.numpy())
 
             print(f"\nComparison with True Labels (Middle Layer):")
-            print(f"   NMI: {nmi_mid:.4f}")
-            print(f"   ARI: {ari_mid:.4f}")
+            print(f"   Homogeneity:  {homogeneity_mid:.4f}")
+            print(f"   Completeness: {completeness_mid:.4f}")
+            print(f"   NMI:          {nmi_mid:.4f}")
+            print(f"   ARI:          {ari_mid:.4f}")
 
     print("\n" + "="*70)
 

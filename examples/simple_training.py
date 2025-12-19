@@ -18,7 +18,9 @@ from deephcd.utils.utilities import LoadData, compute_kappa
 
 # Configuration
 DATA_PATH = './very_small_graph_150/'  # Path to simulated data
+#DATA_PATH = '/Users/audreyq.fu/Documents/GRN/Data/1k_node_graph/'
 OUTPUT_PATH = './training_output/'      # Path for training outputs
+#OUTPUT_PATH = '/Users/audreyq.fu/Documents/GRN/Data/1k_node_graph/training_output/'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Create output directory if it doesn't exist
@@ -88,9 +90,9 @@ print(f"   Final training loss: {output.train_loss_history[-1]['Total Loss']:.4f
 if output.performance_history:
     final_perf = output.performance_history[-1]
     print(f"\n   Performance Metrics (Last Epoch):")
-    print(f"   Top Layer    - NMI: {final_perf[0][2]:.4f}, ARI: {final_perf[0][3]:.4f}")
+    print(f"   Top Layer    - Homogeneity: {final_perf[0][0]:.4f}, Completeness: {final_perf[0][1]:.4f}, NMI: {final_perf[0][2]:.4f}, ARI: {final_perf[0][3]:.4f}")
     if len(final_perf) > 1:
-        print(f"   Middle Layer - NMI: {final_perf[1][2]:.4f}, ARI: {final_perf[1][3]:.4f}")
+        print(f"   Middle Layer - Homogeneity: {final_perf[1][0]:.4f}, Completeness: {final_perf[1][1]:.4f}, NMI: {final_perf[1][2]:.4f}, ARI: {final_perf[1][3]:.4f}")
 
 print(f"\n   Predicted communities:")
 print(f"   Top layer: {len(torch.unique(output.predicted_train['top']))} communities")
