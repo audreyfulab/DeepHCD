@@ -688,7 +688,7 @@ class Trainer():
                                     weight_decay=self.optimizer_weight_decay)
         
         # Loss functions
-        A_recon_loss = nn.BCELoss(reduction='mean')
+        A_recon_loss = nn.BCEWithLogitsLoss(reduction='mean')
         X_recon_loss = nn.MSELoss(reduction='mean')
         modularity_loss_fn = OptimizedModularityLoss()
         clustering_loss_fn = OptimizedClusterLoss()
@@ -742,9 +742,8 @@ class Trainer():
                     
                     
                     # Reconstruction losses
-                    A_hat = torch.clamp(A_hat, min=1e-7, max=1 - 1e-7)
                     X_loss = X_recon_loss(X_hat, X_batch)
-                    A_loss = A_recon_loss(A_hat, A_batch)
+                    A_loss = A_recon_loss(A_logit, A_batch)  # Use logits for numerical stability
                     
                     # Total loss
                     batch_loss = A_loss + self.gamma * X_loss + Clust_loss - self.delta * Mod_loss
