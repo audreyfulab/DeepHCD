@@ -410,14 +410,18 @@ def wcss(X: torch.Tensor, Plist: List[torch.Tensor], method: Literal['bottom_up'
     P: assignment probabilities for assigning N nodes to k clusters
     k: number of clusters
     """
+    device = X.device
     if method == 'bottom_up':
-        P = torch.linalg.multi_dot(Plist)
+        P = torch.linalg.multi_dot([p.to(device) for p in Plist])
     else:
-        P = Plist
+        P = Plist.to(device) if torch.is_tensor(Plist) else Plist[0].to(device)
         
     N = X.shape[0]
-    oneN = torch.ones(N, 1)
-    M = torch.mm(torch.mm(X.T, P), torch.diag(1/torch.mm(oneN.T, P).flatten()))
+    oneN = torch.ones((N, 1), device=device)
+    denom = torch.mm(oneN.T, P).flatten()
+    denom = torch.where(denom == 0, torch.ones_like(denom), denom)
+    D_inv = torch.diag(1.0 / denom).to(device)
+    M = torch.mm(torch.mm(X.T, P), D_inv)
     D = X.T - torch.mm(M, P.T)
     MSW = torch.sum(torch.sqrt(torch.diag(torch.mm(D.T, D))))
     return MSW, M
