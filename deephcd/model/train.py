@@ -732,6 +732,11 @@ class Trainer():
                     # Forward pass
                     forward_output = model.forward(X_batch, A_batch)
                     X_hat, A_hat, A_logit, X_all, A_all, P_all, S_all, AW = forward_output
+
+                    P_all = [
+                       p.to(X_batch.device) if torch.is_tensor(p)
+                       else [q.to(X_batch.device) for q in p]
+                       for p in P_all]
                     
                     # Compute losses efficiently
                     mod_clust_output = self.get_mod_clust_losses(

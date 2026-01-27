@@ -312,8 +312,15 @@ class HCD(nn.Module):
         
         
     def forward(self, X, A):
-        
+        device = X.device
+
+        self.to(device) 
+
+        if self.input_norm.weight.device != X.device:
+
+           self.input_norm = self.input_norm.to(X.device)
         #normalize input
+
         H = self.input_norm(X)
         
         #get embedding representation
@@ -398,9 +405,13 @@ class HCD(nn.Module):
                         
                         
                     else:
-                        
+                        device = X.device
+                        for m in self.MiddleModules:
+
+                           m.to(device)
+                        device = Z.device 
                         # apply k linear predictors
-                        results = [self.MiddleModules[i](sub_Z, sub_A) for idx, (i, sub_Z, sub_A) in enumerate(zip(torch.unique(S[0]), subsets_Z, subsets_A))]
+                        results = [self.MiddleModules[i.item()](sub_Z.to(device), sub_A.to(device)) for idx, (i, sub_Z, sub_A) in enumerate(zip(torch.unique(S[0]), subsets_Z, subsets_A))]
                         #results = [self.MiddleModules[i](sub_Z.unsqueeze(0)) for idx, (i, sub_Z) in enumerate(zip(torch.unique(S[0]), subsets_Z))]
                     
                         #store results
