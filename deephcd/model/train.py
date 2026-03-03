@@ -58,7 +58,7 @@ class EarlyStopping:
     >>> stopper = EarlyStopping(patience=5, delta=0.01, verbose=True)
     >>> for epoch in range(100):
     ...     val_loss = validate(model)
-    ...     stopper(val_loss, model, _type='test')
+    ...     stopper(val_loss, model, _type='validation')
     ...     if stopper.early_stop:
     ...         print("Early stopping triggered.")
     ...         break
@@ -73,7 +73,7 @@ class EarlyStopping:
         self.delta = delta
         self.path = path if path else os.getcwd()
 
-    def __call__(self, loss: float | torch.Tensor | np.ndarray, model: nn.Module, _type: Optional[Literal['test', 'total']]):
+    def __call__(self, loss: float | torch.Tensor | np.ndarray, model: nn.Module, _type: Optional[Literal['validation', 'total']]):
         """Evaluates the current loss and decide whether to continue training.
 
         Parameters
@@ -82,7 +82,7 @@ class EarlyStopping:
             Current loss value to monitor for improvement.
         model : nn.Module
             PyTorch model being trained. A checkpoint is saved if the loss improves.
-        _type : {'test', 'total'}, optional
+        _type : {'validation', 'total'}, optional
             Label indicating the type of loss being monitored; used only for display/logging.
 
         Returns
@@ -148,15 +148,15 @@ class HCD_output:
         Input feature matrix used during training.
     A : torch.Tensor
         Input adjacency matrix representing graph structure.
-    test_set : tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
-        Optional test set containing `(X_test, A_test, labels_test)`.
+    validation_set : tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        Optional validation set containing `(X_val, A_val, labels_val)`.
     labels : torch.Tensor | np.ndarray
         Labels for the training samples.
     model_output : tuple
         Model output tuple containing:
         `(X_final, A_final, _, X_all_final, A_all_final, P_all_final, S_final, AW_final)`.
-    test_history : list[float]
-        Recorded loss values from test epochs.
+    validation_history : list[float]
+        Recorded loss values from validation epochs.
     train_history : list[float]
         Recorded loss values from training epochs.
     perf_history : list[Any]
@@ -180,7 +180,7 @@ class HCD_output:
         Partitioned feature tensors for subgraphs.
     attention_weights : dict[str, list[list[torch.Tensor]]] | None
         Nested attention weights detached from GPU memory.
-    train_loss_history, test_loss_history, performance_history, pred_history : list
+    train_loss_history, validation_loss_history, performance_history, pred_history : list
         Historical metrics from model training.
     probabilities : dict[str, Any]
         Hierarchical prediction probabilities at top and intermediate levels.
@@ -209,16 +209,16 @@ class HCD_output:
         Display the performance summary table if available.
     """
 
-    
+
     def __init__(self,
         X: torch.Tensor,
         A: torch.Tensor,
-        test_set: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        validation_set: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         labels: Union[torch.Tensor, np.ndarray],
         model_output: tuple[
             torch.Tensor, torch.Tensor, Any, tuple, tuple, tuple, tuple, Optional[dict[str, list[list[torch.Tensor]]]]
         ],
-        test_history: list[torch.Tensor | np.ndarray],
+        validation_history: list[torch.Tensor | np.ndarray],
         train_history: list[torch.Tensor | np.ndarray],
         perf_history: list[torch.Tensor | np.ndarray],
         pred_history: list[torch.Tensor | np.ndarray],
@@ -227,7 +227,7 @@ class HCD_output:
         
         # Store only essential data, move to CPU immediately
         X_final, A_final, _, X_all_final, A_all_final, P_all_final, S_final, AW_final = model_output
-        eval_X, eval_A, eval_labels = test_set if test_set else (None, None, None)
+        eval_X, eval_A, eval_labels = validation_set if validation_set else (None, None, None)
 
         self.model_output_history = [
             (X_final, A_final, X_all_final, A_all_final, P_all_final, S_final, AW_final)
@@ -250,7 +250,7 @@ class HCD_output:
         
         # Store histories (these are small)
         self.train_loss_history = train_history
-        self.test_loss_history = test_history
+        self.validation_loss_history = validation_history
         self.performance_history = perf_history
         self.pred_history = pred_history
         
@@ -261,14 +261,14 @@ class HCD_output:
             'labels_train': labels
         }
         
-        if test_set:
-            self.test_data = {
-                'X_test': eval_X.detach().cpu() if eval_X is not None else None,
-                'A_test': eval_A.detach().cpu() if eval_A is not None else None,
-                'labels_test': eval_labels
+        if validation_set:
+            self.validation_data = {
+                'X_val': eval_X.detach().cpu() if eval_X is not None else None,
+                'A_val': eval_A.detach().cpu() if eval_A is not None else None,
+                'labels_val': eval_labels
             }
         else:
-            self.test_data = {'X_test': None, 'A_test': None, 'labels_test': None}
+            self.validation_data = {'X_val': None, 'A_val': None, 'labels_val': None}
             
         self.probabilities = {
             'top': P_all_final[0].detach().cpu(),
@@ -423,8 +423,6 @@ class Trainer():
         Whether to disable the loss term related to adjacency matrix reconstruction.
     validation_data : tuple, optional (default=None)
         Validation dataset provided as (X_val, A_val, val_labels).
-    test_data : tuple, optional (default=None)
-        Test dataset provided as (X_test, A_test, test_labels).
     save_output : bool, optional (default=False)
         Whether to save the model's outputs and training history.
     output_path : str, optional (default='')
@@ -453,13 +451,13 @@ class Trainer():
         - `all_model_output`: List of all model outputs over training.
         - `attention_weights`: Attention weights from the final model.
         - `train_loss_history`: History of training losses.
-        - `test_loss_history`: History of test losses.
+        - `validation_loss_history`: History of validation losses.
         - `performance_history`: Performance metrics over epochs.
         - `latent_features`: Extracted latent feature representations.
         - `partitioned_data`: Data after partitioning into hierarchical clusters.
         - `partitioned_latent_features`: Partitioned latent features at different levels.
         - `training_data`: Dictionary containing training feature matrix and adjacency matrix.
-        - `test_data`: Dictionary containing test feature matrix and adjacency matrix.
+        - `validation_data`: Dictionary containing validation feature matrix and adjacency matrix.
         - `probabilities`: Cluster membership probabilities at different hierarchy levels.
         - `pred_history`: Predicted cluster assignments over epochs.
         - `adjacency`: Graph adjacency structures at different clustering levels.
@@ -468,7 +466,7 @@ class Trainer():
 
     Notes:
     ------
-    - Supports early stopping based on total loss or test loss.
+    - Supports early stopping based on total loss or validation loss.
     - Supports unsupervised learning based on total loss supervised learning based on validation loss when labels are provided.
     - Batch learning is enabled by default but can be disabled for full-batch training.
 
@@ -501,9 +499,8 @@ class Trainer():
                 early_stopping: Optional[bool]=False, 
                 patience: Optional[int]=5, 
                 use_batch_learning: Optional[bool]=True,
-                true_labels: List[str | int] | np.ndarray | torch.Tensor=None, 
-                validation_data: Optional[Dict[str, torch.Tensor]]=None, 
-                test_data: Optional[Dict[str, torch.Tensor]]=None, 
+                true_labels: List[str | int] | np.ndarray | torch.Tensor=None,
+                validation_data: Optional[Dict[str, torch.Tensor]]=None,
                 save_output: Optional[bool]=False, 
                 output_path: Optional[str]=None, 
                 use_logging: Optional[bool]=True,
@@ -526,7 +523,6 @@ class Trainer():
         self.A = A
         self.true_labels = true_labels
         self.validation_data = validation_data
-        self.test_data = test_data
 
         # Training hyperparameters
         self.optimizer_type = optimizer
@@ -577,7 +573,7 @@ class Trainer():
 
         # Initialize memory-efficient histories (stored on CPU only)
         self.train_loss_history: List[Dict[str, float]] = []
-        self.test_loss_history: List[Dict[str, float]] = []
+        self.val_loss_history: List[Dict[str, float]] = []
         self.performance_history: List[Optional[List]] = []
         self.pred_history: List[Optional[List]] = []
 
@@ -672,14 +668,24 @@ class Trainer():
         train_loss_history = []
         perf_hist = []
         pred_list = []
-        test_loss_history = []
+        val_loss_history = []
         
         comm_layers = len(model.comm_sizes)
         
+        # Auto-split for early stopping
+        if self.early_stopping and self.validation_data is None:
+            from deephcd.utils.train_utils import split_dataset
+            self.logprint("No validation data provided. Auto-splitting input data 80/20 for early stopping.")
+            train_set, val_set = split_dataset(self.X, self.A, labels=self.true_labels, split=[0.8, 0.2])
+            self.X, self.A = train_set[0], train_set[1]
+            if train_set[2] is not None:
+                self.true_labels = train_set[2]
+            self.validation_data = val_set
+
         # Early stopping
         if self.early_stopping:
-            early_stop = EarlyStopping(patience=self.patience, 
-                                       verbose=True, 
+            early_stop = EarlyStopping(patience=self.patience,
+                                       verbose=True,
                                        path=self.output_path)
         
         # Optimizer
@@ -784,29 +790,29 @@ class Trainer():
             })
             
             # Evaluation (less frequent to save memory)
-            test_loss = 0.0
-            A_loss_test = 0.0
-            X_loss_test = 0.0
-            if self.test_data:
-                eval_X, eval_A, eval_labels = self.test_data
+            val_loss = 0.0
+            A_loss_val = 0.0
+            X_loss_val = 0.0
+            if self.validation_data:
+                eval_X, eval_A, eval_labels = self.validation_data
                 with memory_efficient_context():
-                    test_perf, test_output, S_replab_test = evaluate(
+                    val_perf, val_output, S_replab_val = evaluate(
                         model, eval_X, eval_A, self.k, eval_labels, device=device
                     )
-                    
-                    if test_output[0] is not None:
-                        X_hat_test, A_hat_test = test_output[0], test_output[1]
+
+                    if val_output[0] is not None:
+                        X_hat_val, A_hat_val = val_output[0], val_output[1]
                         eval_X_dev = eval_X.to(device)
                         eval_A_dev = eval_A.to(device)
-                        X_hat_dev = X_hat_test.to(device)
-                        A_hat_dev = A_hat_test.to(device)
-                        
-                        X_loss_test = X_recon_loss(X_hat_dev, eval_X_dev).item()
-                        A_loss_test = A_recon_loss(A_hat_dev, eval_A_dev).item()
-                        test_loss = A_loss_test + self.gamma * X_loss_test
-                        
-            
-            test_loss_history.append({'Total Loss': test_loss})
+                        X_hat_dev = X_hat_val.to(device)
+                        A_hat_dev = A_hat_val.to(device)
+
+                        X_loss_val = X_recon_loss(X_hat_dev, eval_X_dev).item()
+                        A_loss_val = A_recon_loss(A_hat_dev, eval_A_dev).item()
+                        val_loss = A_loss_val + self.gamma * X_loss_val
+
+
+            val_loss_history.append({'Total Loss': val_loss})
             
             # Performance evaluation (periodic)
             if epoch % self.update_interval == 0:
@@ -824,14 +830,14 @@ class Trainer():
             # Early stopping check
             if self.early_stopping:
                 self.logprint(f"""Early Stopping Start:
-                              A_loss_test: {A_loss_test} 
-                              X_loss_test: {X_loss_test}
-                              Total Loss: {total_loss}
-                              Test Loss: {test_loss}
+                              A_loss_val: {A_loss_val}
+                              X_loss_val: {X_loss_val}
+                              Training Loss: {total_loss}
+                              Validation Loss: {val_loss}
                               """)
 
-                loss_value = test_loss if self.test_data else total_loss
-                loss_type = 'test' if self.test_data else 'total'
+                loss_value = val_loss if self.validation_data else total_loss
+                loss_type = 'validation' if self.validation_data else 'total'
                 early_stop(loss_value, model, loss_type)
                 if early_stop.early_stop:
                     self.logprint("Early stopping triggered")
@@ -839,7 +845,7 @@ class Trainer():
             
             epoch_time = time.time() - epoch_start
             if self.verbose:
-                self.logprint(f'Epoch {epoch + 1} completed in {epoch_time:.2f}s Total Loss: {total_loss:.4f}')
+                self.logprint(f'Epoch {epoch + 1} completed in {epoch_time:.2f}s Training Loss: {total_loss:.4f}')
                 self.logprint('-' * 50)
         
         # Final model output
@@ -860,9 +866,9 @@ class Trainer():
         
         # Create output object
         output = HCD_output(
-            X=self.X, A=self.A, test_set=self.test_data, labels=self.true_labels,
+            X=self.X, A=self.A, validation_set=self.validation_data, labels=self.true_labels,
             model_output=final_out_cpu, train_history=train_loss_history,
-            test_history=test_loss_history, perf_history=perf_hist,
+            validation_history=val_loss_history, perf_history=perf_hist,
             pred_history=pred_list, batch_indices=self.batch_indices_list
         )
         

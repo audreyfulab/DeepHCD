@@ -4,7 +4,7 @@ Inference Example: Load Trained Model and Predict on New Data
 
 This example shows how to:
 1. Load a previously trained model
-2. Run inference on new/test data
+2. Run inference on new data
 3. Analyze predictions
 """
 

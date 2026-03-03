@@ -171,14 +171,14 @@ def load_batch_output(
 def split_dataset(
     X: torch.Tensor,
     A: torch.Tensor,
-    labels: List[torch.Tensor],
+    labels: Optional[List[torch.Tensor]] = None,
     split: List[float] = [0.8, 0.2]
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """
-    Split a node-level graph dataset into training and testing sets.
+    Split a node-level graph dataset into training and validation sets.
 
     This function randomly shuffles node indices and partitions the feature matrix,
-    adjacency matrix, and label tensors into training and test subsets according 
+    adjacency matrix, and label tensors into training and validation subsets according
     to the provided split ratio. Sorting is applied to maintain consistent node ordering
     within each split.
 
@@ -188,10 +188,11 @@ def split_dataset(
         Node feature matrix of shape `(num_nodes, num_features)`.
     A : torch.Tensor
         Adjacency matrix of shape `(num_nodes, num_nodes)` representing graph structure.
-    labels : list[torch.Tensor]
+    labels : list[torch.Tensor], optional
         List of label tensors for each layer or task, each of shape `(num_nodes,)`.
+        If None, the labels portion of each returned set will be None.
     split : list[float], default=[0.8, 0.2]
-        Fraction of data for training and testing, respectively. Must sum to 1.0.
+        Fraction of data for training and validation, respectively. Must sum to 1.0.
 
     Returns
     -------
@@ -199,12 +200,12 @@ def split_dataset(
         - **train_set** : [train_X, train_A, labels_train]
           - `train_X` (torch.Tensor): Training node features.
           - `train_A` (torch.Tensor): Adjacency submatrix for training nodes.
-          - `labels_train` (list[torch.Tensor]): Labels for training nodes.
-          
-        - **test_set** : [test_X, test_A, labels_test]
-          - `test_X` (torch.Tensor): Test node features.
-          - `test_A` (torch.Tensor): Adjacency submatrix for test nodes.
-          - `labels_test` (list[torch.Tensor]): Labels for test nodes.
+          - `labels_train` (list[torch.Tensor] | None): Labels for training nodes.
+
+        - **val_set** : [val_X, val_A, labels_val]
+          - `val_X` (torch.Tensor): Validation node features.
+          - `val_A` (torch.Tensor): Adjacency submatrix for validation nodes.
+          - `labels_val` (list[torch.Tensor] | None): Labels for validation nodes.
 
     Notes
     -----
@@ -217,7 +218,7 @@ def split_dataset(
     >>> X = torch.randn(100, 16)
     >>> A = torch.randint(0, 2, (100, 100))
     >>> labels = [torch.randint(0, 2, (100,))]
-    >>> train_set, test_set = split_dataset(X, A, labels)
+    >>> train_set, val_set = split_dataset(X, A, labels)
     >>> [x.shape for x in train_set[:2]]
     [torch.Size([80, 16]), torch.Size([80, 80])]
     """
@@ -226,29 +227,33 @@ def split_dataset(
     assert A.shape == (num_nodes, num_nodes), "Adjacency matrix must be square and match feature dimension"
     assert np.isclose(sum(split), 1.0, atol=1e-5), "Split ratios must sum to 1.0"
 
-    # Determine train/test sizes
+    # Determine train/val sizes
     train_size = int(np.round(split[0] * num_nodes))
 
     # Randomly permute node indices
     indices = torch.randperm(num_nodes)
     train_indices = torch.sort(indices[:train_size]).values
-    test_indices = torch.sort(indices[train_size:]).values
+    val_indices = torch.sort(indices[train_size:]).values
 
     # Slice features and adjacency matrices
     train_X = X[train_indices]
-    test_X = X[test_indices]
+    val_X = X[val_indices]
     train_A = A[train_indices][:, train_indices]
-    test_A = A[test_indices][:, test_indices]
+    val_A = A[val_indices][:, val_indices]
 
-    # Slice labels for each layer
-    labels_train = [lab[train_indices] for lab in labels]
-    labels_test = [lab[test_indices] for lab in labels]
+    # Slice labels for each layer (if provided)
+    if labels is not None:
+        labels_train = [lab[train_indices] for lab in labels]
+        labels_val = [lab[val_indices] for lab in labels]
+    else:
+        labels_train = None
+        labels_val = None
 
     # Package outputs
     train_set = [train_X, train_A, labels_train]
-    test_set = [test_X, test_A, labels_test]
+    val_set = [val_X, val_A, labels_val]
 
-    return train_set, test_set
+    return train_set, val_set
 
 
 

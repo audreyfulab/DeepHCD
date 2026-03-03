@@ -167,10 +167,10 @@ def main():
     parser.add_argument('--attn_heads', type = int, default = 5, help='The number of attention heads for multihead attention')
     parser.add_argument('--normalize_layers', type=bool, default = True, help='When True, the output of each neural layer is normalized before activation')
     parser.add_argument('--normalize_input', type=bool, default=True, help='When True, the input features are normalized before model fitting')
-    parser.add_argument('--split_data', type=bool, default=False, help='When True, data is split into training, testing, and validation sets (currently validation splitting doesnt work)')
+    parser.add_argument('--split_data', type=bool, default=False, help='When True, data is split into training and validation sets')
     parser.add_argument('--early_stopping', type=bool, default=True, help='If True, early stopping is used during training')
     parser.add_argument('--patience', type=int, default=5, help='Number of consecutive epochs with no improvement after which training will stop (only relevant if early stopping is enabled).')
-    parser.add_argument('--train_test_size', nargs='+', type=Literal[float], default = [0.8, 0.2], help='Specifies the fraction of data in training and testing sets respectively')
+    parser.add_argument('--train_val_size', nargs='+', type=Literal[float], default = [0.8, 0.2], help='Specifies the fraction of data in training and validation sets respectively')
     parser.add_argument('--post_hoc_plots', type=bool, default=True, help='When True, additional plots of results are made')
     parser.add_argument('--add_output_layers', type=bool, default=False, help ='When True, extra neural layers are added between the embedding and prediction layers')
     parser.add_argument('--make_directories', type=bool, default=False, help='If true directories are created using os.makedir()')
@@ -287,7 +287,7 @@ def main():
     args.run_louvain = True
     args.run_hc = True
     args.split_data = True
-    args.train_test_size = [0.8, 0.2]
+    args.train_val_size = [0.8, 0.2]
 
     tracemalloc.start()
     #generate data and train model - returns output object of class HCD_output
@@ -301,7 +301,7 @@ def main():
     '''
     device = 'cuda:'+str(0) if args.use_gpu and torch.cuda.is_available() else 'cpu'
     X, A, target_labels = set_up_model_for_simulation_inplace(args, sim_args, load_from_existing=args.load_from_existing)
-    train, test = split_dataset(X, A, target_labels, args.train_test_size)
+    train, val_set = split_dataset(X, A, target_labels, args.train_val_size)
     X, A, target_labels = train
     nodes, attrib = X.shape
     if args.compute_optimal_clusters:
@@ -325,7 +325,7 @@ def main():
                 heads=1
                 ).to(device)
     
-    trainer = Trainer(model, X, A, epochs=50, learning_rate=1e-3, batch_size=32, early_stopping=True, patience=5,output_path=args.sp)
+    trainer = Trainer(model, X, A, epochs=50, learning_rate=1e-3, batch_size=32, early_stopping=True, patience=5, validation_data=val_set, output_path=args.sp)
     trainer.fit(device)
 
 

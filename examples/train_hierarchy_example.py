@@ -4,7 +4,7 @@ Comprehensive Example: Train DeepHCD Model with Full Options
 
 This example demonstrates the complete training workflow with:
 - Data loading and preprocessing
-- Train/test splitting
+- Train/validation splitting
 - Model configuration
 - Training with validation
 - Results visualization and evaluation
@@ -81,9 +81,9 @@ def main():
 
     # Data splitting
     parser.add_argument('--split_data', action='store_true', default=False,
-                       help='Split data into train/test sets')
-    parser.add_argument('--train_test_split', nargs=2, type=float, default=[0.8, 0.2],
-                       help='Train/test split ratio')
+                       help='Split data into train/validation sets')
+    parser.add_argument('--train_val_split', nargs=2, type=float, default=[0.8, 0.2],
+                       help='Train/validation split ratio')
 
     # Output settings
     parser.add_argument('--output_path', type=str, default='./training_output/',
@@ -149,13 +149,13 @@ def main():
     print(f"   True communities: Top={len(set(sorted_top))}, Middle={len(set(sorted_mid))}")
 
     # Split data if requested
-    test_data = None
+    validation_data = None
     if args.split_data:
-        print(f"\nSplitting data ({args.train_test_split[0]:.0%} train, {args.train_test_split[1]:.0%} test)...")
-        train, test = split_dataset(X, A, true_labels, args.train_test_split)
+        print(f"\nSplitting data ({args.train_val_split[0]:.0%} train, {args.train_val_split[1]:.0%} validation)...")
+        train, val_set = split_dataset(X, A, true_labels, args.train_val_split)
         X, A, true_labels = train
-        test_data = test
-        print(f"   Train: {X.shape[0]} nodes, Test: {test[0].shape[0]} nodes")
+        validation_data = val_set
+        print(f"   Train: {X.shape[0]} nodes, Validation: {val_set[0].shape[0]} nodes")
 
     # Compute optimal communities
     if args.compute_optimal_clusters:
@@ -205,7 +205,7 @@ def main():
         early_stopping=args.early_stopping,
         patience=args.patience,
         true_labels=true_labels,
-        test_data=test_data,
+        validation_data=validation_data,
         output_path=args.output_path,
         verbose=args.verbose
     )
@@ -224,8 +224,8 @@ def main():
     print(f"   Total epochs: {len(output.train_loss_history)}")
     print(f"   Final training loss: {output.train_loss_history[-1]['Total Loss']:.4f}")
 
-    if test_data and output.test_loss_history:
-        print(f"   Final test loss: {output.test_loss_history[-1]['Total Loss']:.4f}")
+    if validation_data and output.validation_loss_history:
+        print(f"   Final validation loss: {output.validation_loss_history[-1]['Total Loss']:.4f}")
 
     if output.performance_history:
         final_perf = output.performance_history[-1]
