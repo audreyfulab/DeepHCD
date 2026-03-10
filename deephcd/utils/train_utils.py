@@ -399,8 +399,8 @@ def modularity(A: torch.Tensor, P: torch.Tensor, res: Optional[float] = 1.0) -> 
     """
     r = A.sum(dim = 1)
     n = A.sum()
-    B = A - res*(torch.outer(r,r) / n)
-    modularity = torch.trace(torch.mm(P.T, torch.mm(B, P)))/(n)
+    B = A - res*(torch.outer(r,r) / (n + 1e-8))
+    modularity = torch.trace(torch.mm(P.T, torch.mm(B, P)))/(n + 1e-8)
     return modularity
 
 
@@ -426,7 +426,9 @@ def wcss(X: torch.Tensor, Plist: List[torch.Tensor], method: Literal['bottom_up'
     denom = torch.mm(oneN.T, P).flatten()
     denom = torch.where(denom == 0, torch.ones_like(denom), denom)
     D_inv = torch.diag(1.0 / denom).to(device)
-    M = torch.mm(torch.mm(X.T, P), D_inv)
+    #M = torch.mm(torch.mm(X.T, P), D_inv)
+    cluster_sizes = torch.mm(oneN.T, P).flatten()
+    M = torch.mm(torch.mm(X.T, P), torch.diag(1/(cluster_sizes + 1e-8)))
     D = X.T - torch.mm(M, P.T)
     MSW = torch.sum(torch.sqrt(torch.diag(torch.mm(D.T, D))))
     return MSW, M

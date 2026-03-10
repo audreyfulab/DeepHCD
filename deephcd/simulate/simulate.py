@@ -88,14 +88,17 @@ def simulate_graph(args):
         #draw directed graph
         fig, ax = plt.subplots(figsize = (14,10))
         topfig = plot_diGraph(fig, ax, h1_graph, return_fig=True)
-        topfig.savefig(args.savepath+'top_layer_graph.pdf')
-        topfig.savefig(args.savepath+'top_layer_graph.png', dpi = 500)
+
+        if args.save_pdf:
+            topfig.savefig(args.savepath+'top_layer_graph.pdf')
+        if args.save_png:
+            topfig.savefig(args.savepath+'top_layer_graph.png', dpi=500)
         
         #sort toplayer
         ts_h1_graph = list(nx.topological_sort(h1_graph))
         adj_h1_graph = nx.adjacency_matrix(h1_graph, ts_h1_graph).todense()
         h1_in_degree = [i[1] for i in h1_graph.in_degree()]
-        h1_out_degree = [i[1] for i in h1_graph.in_degree()]
+        h1_out_degree = [i[1] for i in h1_graph.out_degree()]
         top_layer_time_end = time.time()
     #for networks with disconnected top layer
     if args.connect == 'disc':

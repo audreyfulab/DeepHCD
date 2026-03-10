@@ -544,6 +544,7 @@ class Trainer():
         self.verbose = verbose
         
         #set up logger
+
         if use_logging:
             if log_to_file:
                 logpath = os.path.join(output_path, 'logfile.txt')

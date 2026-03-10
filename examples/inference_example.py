@@ -70,6 +70,7 @@ def predict(model, X, A, device='cpu'):
 
 
 def main():
+    
     parser = argparse.ArgumentParser(description='Run inference with trained HCD model')
     parser.add_argument('--model_path', type=str, required=True,
                        help='Path to trained model checkpoint (.pth file)')
@@ -77,8 +78,12 @@ def main():
                        help='Path to data directory')
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'],
                        help='Device to use for inference')
+    
+    args = parser.parse_args([
+    '--model_path', '/Users/jordandavis/Documents/DeepHCD_copy/DeepHCD/examples/training_output/trained_model.pth',
+    '--data_path', '/Users/jordandavis/Documents/DeepHCD_copy/DeepHCD/examples/very_small_graph_150'
+    ])
 
-    args = parser.parse_args()
 
     # Set device
     if args.device == 'auto':

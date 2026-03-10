@@ -215,10 +215,10 @@ def main():
     sim_args.set_seed = True
     sim_args.seed_number = 555
     #sim_args.savepath = '/Users/jordandavis/Desktop/HGRN_repo/attempt_on_test7/test6/'
-    sim_args.savepath = '/Users/audreyq.fu/Documents/Programs/DeepHCD/examples/very_small_graph_150/'
+    sim_args.savepath = '/Users/jordandavis/Documents/DeepHCD_copy/DeepHCD/examples/very_small_graph_150'
 
     #output save settings
-    args.sp = '/Users/audreyq.fu/Documents/Programs/DeepHCD/examples/output/'
+    args.sp = './main_test/'
     args.use_gpu = True
     sim_args.use_multihead_attn = True
     args.save_results = True

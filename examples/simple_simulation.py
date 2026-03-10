@@ -17,8 +17,8 @@ args = argparse.Namespace()
 # Network structure (creates ~5 → 15 → 150 nodes across 3 layers)
 args.connect = 'disc'                    # Disconnected top layer
 args.top_layer_nodes = 5                 # 5 top communities
-args.nodes_per_super2 = (3, 3)          # 3 nodes per top community → 15 middle nodes
-args.nodes_per_super3 = (10, 12)        # 10-12 nodes per middle node → ~150 bottom nodes
+args.nodes_per_super2 = (10, 10)          # 3 nodes per top community → 15 middle nodes
+args.nodes_per_super3 = (20, 20)        # 10-12 nodes per middle node → ~150 bottom nodes
 args.layers = 3                          # 3-layer hierarchy
 
 # Subgraph topology
@@ -48,7 +48,7 @@ args.set_seed = True
 args.seed_number = 42
 
 # Output
-args.savepath = './my_simulated_network/'
+args.savepath = './1k_graph/'
 
 # Create output directory
 os.makedirs(args.savepath, exist_ok=True)

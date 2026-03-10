@@ -7,6 +7,8 @@ from collections import OrderedDict
 from torchinfo import summary
 from torch_kmeans import SoftKMeans
 from typing import Optional, Union, List,  Literal
+import numpy as np
+import os
 
 
 def select_class(X: torch.Tensor, labels: torch.Tensor, k: int, dim: int = 0, return_index: bool = False):
@@ -316,8 +318,7 @@ class HCD(nn.Module):
 
         self.to(device) 
 
-        if self.input_norm.weight.device != X.device:
-
+        if hasattr(self.input_norm, 'weight') and self.input_norm.weight.device != X.device:
            self.input_norm = self.input_norm.to(X.device)
         #normalize input
 
@@ -326,9 +327,13 @@ class HCD(nn.Module):
         #get embedding representation
         Z, A, encoder_attention_weights = self.encoder(H,A)
         
-        sim = torch.mm(Z, Z.T)
+        # Normalize embeddings before dot product
+        Z_norm = F.normalize(Z, p=2, dim=1)
+        #find other normalize functions
+        sim = torch.mm(Z_norm, Z_norm.T)
+        A_hat = self.dpd_act(sim)
         sim = torch.clamp(sim, -10, 10)
-        A_hat = self.dpd_act(self.dpd_norm(sim))
+        
 
         A_logits = self.dpd_norm(torch.mm(Z, Z.transpose(0,1)))
         #A_hat = self.dpd_act(self.dpd_norm(torch.mm(Z, Z.transpose(0,1))))        
@@ -458,4 +463,3 @@ class HCD(nn.Module):
                 for i in range(self.comm_sizes[0]):
                     print(f'COMMUNITY {i} MODEL: \n')
                     summary(self.MiddleModules[i])
-    

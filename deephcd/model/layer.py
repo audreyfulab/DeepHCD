@@ -324,9 +324,12 @@ class Comm_DenseLayer2(nn.Module):
             H = self.out_norm(M)
         
         # class prediction probabilities
+       
         OL = self.output_linear(H)
-        P = F.softmax(OL, dim = 1)
-        
+        OL = torch.clamp(OL, min=-10, max=10)
+        OL_stable = OL - OL.max(dim=1, keepdim=True)[0]  # Subtract max for stability
+        P = F.softmax(OL_stable, dim=1)
+
         #get the centroids and layer adjacency matrix
         X_tilde = torch.mm(torch.mm(Z.T, P), torch.diag(1/P.sum(dim = 0)+1e-8)).T
         

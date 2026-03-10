@@ -1,0 +1,9 @@
+name: hgrnenv
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pandas
+  - matplotlib
+  - ipykernel
+prefix: /Users/jordandavis/miniconda3/envs/hgrnenv

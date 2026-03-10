@@ -447,10 +447,10 @@ def sort_labels(labels):
 
 #----------------------------------------------------------------
 def LoadData(filename):
-    unparsed_labels = pd.read_csv(filename+'_gexp.csv', index_col=0).columns.tolist()
+    unparsed_labels = pd.read_csv(filename+'/_gexp.csv', index_col=0).columns.tolist()
     flat_list_indices, flat_list_indices2, new_true_labels, sorted_true_labels_top, sorted_true_labels_middle = sort_labels(unparsed_labels)
-    pe = np.load(filename+'_gexp.npy').transpose()
-    true_adj = build_true_graph(filename+'.npz')
+    pe = np.load(filename+'/_gexp.npy').transpose()
+    true_adj = build_true_graph(filename+'/.npz')
     G = nx.from_numpy_array(true_adj)
     G = G.to_undirected()
     true_adj_undi = nx.adjacency_matrix(G).toarray()

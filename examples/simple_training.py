@@ -15,11 +15,14 @@ import torch
 from deephcd.model.model import HCD
 from deephcd.model.train import Trainer
 from deephcd.utils.utilities import LoadData, compute_kappa
+from deephcd.utils.train_utils import split_dataset
+import time
 
+start_time = time.perf_counter()
 # Configuration
-DATA_PATH = './very_small_graph_150/'  # Path to simulated data
+DATA_PATH = '/Users/jordandavis/Documents/DeepHCD_copy/DeepHCD/examples/very_small_graph_150'  # Path to simulated data
 #DATA_PATH = '/Users/audreyq.fu/Documents/GRN/Data/1k_node_graph/'
-OUTPUT_PATH = './training_output/'      # Path for training outputs
+OUTPUT_PATH = './test_150/'      # Path for training outputs
 #OUTPUT_PATH = '/Users/audreyq.fu/Documents/GRN/Data/1k_node_graph/training_output/'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -47,6 +50,9 @@ comm_sizes = compute_kappa(X, A, method='bethe_hessian', verbose=False)
 print(f"   Estimated communities: {comm_sizes}")
 
 # 3. Create model
+
+train_set, test_set = split_dataset(X,A,labels)
+
 print("\n3. Creating HCD model...")
 model = HCD(
     nodes=nodes,
@@ -65,8 +71,9 @@ print(f"   Model created with {sum(p.numel() for p in model.parameters()):,} par
 print("\n4. Training model...")
 trainer = Trainer(
     model=model,
-    X=X,
+    X=train_set,
     A=A,
+    test_data=test_set,
     epochs=30,                      # Number of training epochs
     learning_rate=1e-3,             # Learning rate
     batch_size=32,                  # Batch size
@@ -120,3 +127,12 @@ torch.save({
     }
 }, MODEL_PATH)
 print(f"\nModel saved to: {MODEL_PATH}")
+
+end_time = time.perf_counter()
+file_path = "./1kgraph_numeric_stability_inference/time_of_execution.txt"
+
+with open(file_path, "w") as file:
+    elapsed_time = end_time - start_time
+    file.write(f"Execution time: {elapsed_time:.4f} seconds")
+    
+print(f"File '{file_path}' created successfully.")
