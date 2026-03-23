@@ -416,13 +416,11 @@ with StepTimer("Step 4: Model Creation"):
         ae_attn_heads=2
     ).to(DEVICE)
 
+    # DDP is intentionally disabled: the Trainer does its own random mini-batching
+    # independently per rank, so ranks drift out of sync and deadlock on all-reduce.
+    # Multi-node benefit comes from parallel data loading and graph construction above.
     if WORLD_SIZE > 1:
-        device_ids = [RANK % torch.cuda.device_count()] if torch.cuda.is_available() else None
-        model = DDP(model, device_ids=device_ids)
-        # DDP doesn't proxy unknown attributes — expose what Trainer accesses directly
-        model.comm_sizes = model.module.comm_sizes
-        model.method     = model.module.method
-        log(f"  Model wrapped in DistributedDataParallel (world_size={WORLD_SIZE})")
+        log("  Note: DDP skipped — Trainer not compatible with gradient synchronisation")
 
 n_params = sum(p.numel() for p in model.parameters())
 log(f"Model: {n_params:,} parameters")
@@ -435,42 +433,40 @@ log("\n" + "=" * 80)
 log("STEP 5: Training Model")
 log("=" * 80)
 
-trainer = Trainer(
-    model=model,
-    X=X,
-    A=A,
-    epochs=EPOCHS,
-    learning_rate=LEARNING_RATE,
-    batch_size=BATCH_SIZE,
-    gamma=1.0,
-    delta=1.0,
-    _lambda=[1.0, 1.0],
-    graph_resolutions=[1.0, 1.0],
-    k=len(comm_sizes),
-    early_stopping=EARLY_STOPPING,
-    patience=PATIENCE,
-    use_batch_learning=True,
-    true_labels=true_labels,
-    output_path=OUTPUT_PATH,
-    save_output=IS_MAIN,
-    use_logging=IS_MAIN,
-    log_to_file=IS_MAIN,
-    verbose=IS_MAIN
-)
+# Only rank 0 trains — other ranks finished their job during parallel graph building
+if IS_MAIN:
+    trainer = Trainer(
+        model=model,
+        X=X,
+        A=A,
+        epochs=EPOCHS,
+        learning_rate=LEARNING_RATE,
+        batch_size=BATCH_SIZE,
+        gamma=1.0,
+        delta=1.0,
+        _lambda=[1.0, 1.0],
+        graph_resolutions=[1.0, 1.0],
+        k=len(comm_sizes),
+        early_stopping=EARLY_STOPPING,
+        patience=PATIENCE,
+        use_batch_learning=True,
+        true_labels=true_labels,
+        output_path=OUTPUT_PATH,
+        save_output=True,
+        use_logging=True,
+        log_to_file=True,
+        verbose=True
+    )
 
-log("Starting training...\n")
-if WORLD_SIZE > 1:
-    dist.barrier()   # ensure all ranks enter training together
-reset_forward_timing()
-with StepTimer("Step 5: Training"):
-    output = trainer.fit(DEVICE)
-if WORLD_SIZE > 1:
-    dist.barrier()   # wait for all ranks before saving
+    log("Starting training...\n")
+    reset_forward_timing()
+    with StepTimer("Step 5: Training"):
+        output = trainer.fit(DEVICE)
 
-_gate_encoder_s = forward_timing['gate_encoder']
-_gate_decoder_s = forward_timing['gate_decoder']
-_clustering_s   = forward_timing['clustering']
-_forward_calls  = forward_timing['calls']
+    _gate_encoder_s = forward_timing['gate_encoder']
+    _gate_decoder_s = forward_timing['gate_decoder']
+    _clustering_s   = forward_timing['clustering']
+    _forward_calls  = forward_timing['calls']
 
 # ============================================================================
 # STEPS 6 & 7: Save Results + Heatmaps  [rank 0 only]
