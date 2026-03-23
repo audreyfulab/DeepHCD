@@ -50,8 +50,7 @@ RANDOM_SEED = 42
 CLUSTER_COLUMN = 'seurat_clusters'
 
 # PCA / graph settings
-USE_PCA = True
-N_PCS = 50
+N_PCS = 50       # PCA components for dimension reduction
 K_NEIGHBORS = 30
 
 os.makedirs(CONVERTED_DATA_DIR, exist_ok=True)
@@ -288,11 +287,7 @@ print("\n" + "=" * 80)
 print("STEP 1.5: Applying Subset")
 print("=" * 80)
 
-# Dense form needed for PCA/training; convert lazily
 expr = data['expression']
-if issparse(expr):
-    print("Converting sparse expression to dense for downstream use...")
-    expr = expr.toarray()
 
 # Ensure cells × genes orientation
 if expr.shape[0] < expr.shape[1]:
@@ -332,18 +327,13 @@ if USE_SUBSET and total_cells > SUBSET_SIZE:
     data['cells'] = [data['cells'][i] for i in indices]
     data['metadata'] = data['metadata'].iloc[indices].copy()
     if data['adjacency'] is not None:
-        adj = data['adjacency']
-        if issparse(adj):
-            adj = adj.toarray()
-        data['adjacency'] = adj[indices][:, indices]
+        data['adjacency'] = data['adjacency'][indices][:, indices]
     if data['labels'] is not None:
         data['labels'] = data['labels'][indices]
 
     print(f"\nSUBSET APPLIED: {expr.shape[0]} cells × {expr.shape[1]} genes")
 
 else:
-    if data['adjacency'] is not None and issparse(data['adjacency']):
-        data['adjacency'] = data['adjacency'].toarray()
     print("Using full dataset")
 
 # ============================================================================
@@ -354,36 +344,39 @@ print("\n" + "=" * 80)
 print("STEP 2: Preparing Data")
 print("=" * 80)
 
-from sklearn.decomposition import PCA
+from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import StandardScaler
 
 n_cells, n_genes = expr.shape
 print(f"Working with: {n_cells} cells × {n_genes} genes")
 
-if USE_PCA and n_genes > N_PCS:
-    print(f"\nApplying PCA: {n_genes} genes → {N_PCS} PCs")
-    pca = PCA(n_components=N_PCS, random_state=42)
-    X = pca.fit_transform(expr)
-    print(f"  Variance explained: {pca.explained_variance_ratio_.sum():.1%}")
+if n_genes > N_PCS:
+    print(f"\nApplying TruncatedSVD (sparse PCA): {n_genes} genes → {N_PCS} PCs")
+    svd = TruncatedSVD(n_components=N_PCS, random_state=42)
+    X = svd.fit_transform(expr)
+    print(f"  Variance explained: {svd.explained_variance_ratio_.sum():.1%}")
+    print(f"  PCA embedding shape: {X.shape}")
 else:
-    X = expr
+    X = expr.toarray() if issparse(expr) else expr
 
 print("\nNormalizing features...")
 scaler = StandardScaler()
 X = scaler.fit_transform(X)
 
 if data['adjacency'] is not None and data['adjacency'].shape[0] == n_cells:
-    print("\nUsing Seurat SNN adjacency matrix...")
-    A_graph, A = get_input_graph(X=X, method='KNN', K=K_NEIGHBORS)
+    print("\nUsing Seurat SNN adjacency matrix (correlation-based SNN — no KNN rebuild)...")
+    A_np = (data['adjacency'].toarray() if issparse(data['adjacency'])
+            else data['adjacency']).astype(np.float32)
+    n_edges = int((A_np > 0).sum())
+    print(f"  {n_cells} nodes, {n_edges} edges")
+    print(f"  Adjacency density: {A_np.sum() / (n_cells**2):.4f}")
 else:
-    print("\nBuilding KNN graph from PCA features...")
-    A_graph, A = get_input_graph(X=X, method='KNN', K=K_NEIGHBORS, metric='1-R^2')
+    print("\nNo adjacency matrix found — building KNN graph from PCA features...")
+    A_graph, A_np = get_input_graph(X=X, method='KNN', K=K_NEIGHBORS, metric='1-R^2')
+    print(f"  Graph: {A_graph.number_of_nodes()} nodes, {A_graph.number_of_edges()} edges")
+    print(f"  Adjacency density: {A_np.sum() / (n_cells**2):.4f}")
 
-print(f"  Graph: {A_graph.number_of_nodes()} nodes, {A_graph.number_of_edges()} edges")
-print(f"  Adjacency density: {A.sum() / (n_cells**2):.4f}")
-
-A = torch.FloatTensor(A)
-A = torch.clamp(A + torch.eye(A.shape[0]), 0, 1)
+A = torch.clamp(torch.FloatTensor(A_np) + torch.eye(n_cells), 0, 1)
 X = torch.FloatTensor(X)
 nodes, features = X.shape
 

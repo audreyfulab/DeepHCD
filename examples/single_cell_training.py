@@ -1,33 +1,110 @@
 """
 Train DeepHCD on SUBSET of Converted Seurat RDS Data
-This version ACTUALLY subsets the data properly!
+Supports single-process and multi-node distributed training via torch.distributed.
+
+Launch (single process):
+    python -u single_cell_training.py
+
+Launch (multi-node, torchrun — recommended):
+    torchrun --nnodes=$SLURM_NNODES --nproc_per_node=$GPUS_PER_NODE \\
+        --rdzv_id=$SLURM_JOB_ID --rdzv_backend=c10d \\
+        --rdzv_endpoint=$MASTER_ADDR:29500 \\
+        single_cell_training.py
+
+Launch (multi-node, MPI):
+    mpirun -n $TOTAL_PROCS python -u single_cell_training.py
+
+SLURM job script tip: always set PYTHONUNBUFFERED=1 so output is not lost if
+the job is killed before buffers flush.
 """
 
 import os
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 import pandas as pd
 from scipy.io import mmread
-from sklearn.decomposition import PCA
+from scipy.sparse import issparse
+from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import kneighbors_graph
 import time
+import tracemalloc
 
-from deephcd.model.model import HCD
+from deephcd.model.model import HCD, forward_timing, reset_forward_timing
 from deephcd.model.train import Trainer
 from deephcd.utils.utilities import compute_kappa
 from deephcd.utils.utilities import get_input_graph
 
+# ── Distributed setup ────────────────────────────────────────────────────────
+
+def _init_distributed():
+    """
+    Initialize torch.distributed when running under torchrun or MPI.
+    Falls back to (rank=0, world_size=1) for plain `python` launches.
+    """
+    is_distributed = (
+        dist.is_available() and
+        ('RANK' in os.environ or 'OMPI_COMM_WORLD_RANK' in os.environ)
+    )
+    if not is_distributed:
+        return 0, 1
+    backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+    dist.init_process_group(backend=backend)
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank % torch.cuda.device_count())
+    return rank, world_size
+
+RANK, WORLD_SIZE = _init_distributed()
+IS_MAIN = RANK == 0
+
+def log(*args, **kwargs):
+    """Print only from rank 0, always flushed (important for SLURM log files)."""
+    if IS_MAIN:
+        print(*args, **kwargs, flush=True)
+
+# ── Timing / memory infrastructure ──────────────────────────────────────────
+
+_step_times = {}
+
+class StepTimer:
+    """Context manager: times a step and, on rank 0, captures peak memory."""
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        if IS_MAIN:
+            tracemalloc.clear_traces()
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *_):
+        elapsed = time.perf_counter() - self._t0
+        if IS_MAIN:
+            _, peak = tracemalloc.get_traced_memory()
+            _step_times[self.name] = (elapsed, peak / 1024 / 1024)
+            print(f"  [{self.name}] done in {_fmt(elapsed)}", flush=True)
+
+def _fmt(seconds):
+    if seconds >= 60:
+        return f"{seconds/60:.1f} min"
+    return f"{seconds:.2f}s"
+
+if IS_MAIN:
+    tracemalloc.start()
 start_time = time.perf_counter()
 
 # ============================================================================
 # SUBSET CONFIGURATION - SET THESE!
 # ============================================================================
 
-USE_SUBSET = True           # ← Set to True to enable subsetting
-SUBSET_SIZE = 500          # ← Number of cells you want (change this!)
-SUBSET_METHOD = 'random'    # Options: 'random', 'stratified'
-RANDOM_SEED = 42            # For reproducibility
+USE_SUBSET = True
+SUBSET_SIZE = 500
+SUBSET_METHOD = 'stratified'    # 'random' or 'stratified'
+RANDOM_SEED = 42
 
 # ============================================================================
 # Configuration
@@ -38,365 +115,298 @@ CONVERTED_DATA_DIR = os.path.join(_SCRIPT_DIR, 'converted_data')
 OUTPUT_PATH = os.path.join(_SCRIPT_DIR, 'deephcd_subset_training')
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Training hyperparameters (will auto-adjust based on subset size)
-USE_PCA = True
 N_PCS = 50
-BUILD_KNN_IF_NO_GRAPH = True
 K_NEIGHBORS = 30
 
-os.makedirs(OUTPUT_PATH, exist_ok=True)
+if IS_MAIN:
+    os.makedirs(OUTPUT_PATH, exist_ok=True)
 
-print("="*80)
-print("TRAINING DEEPHCD MODEL - SUBSET MODE")
-print("="*80)
-print(f"\nDevice: {DEVICE}")
-print(f"Subset enabled: {USE_SUBSET}")
+log("=" * 80)
+log("TRAINING DEEPHCD MODEL - MULTI-NODE DISTRIBUTED MODE")
+log("=" * 80)
+log(f"\nDevice: {DEVICE}")
+log(f"World size: {WORLD_SIZE} processes")
+log(f"Subset enabled: {USE_SUBSET}")
 if USE_SUBSET:
-    print(f"Target subset size: {SUBSET_SIZE} cells")
-    print(f"Subset method: {SUBSET_METHOD}")
+    log(f"Target subset size: {SUBSET_SIZE} cells")
+    log(f"Subset method: {SUBSET_METHOD}")
 
 # ============================================================================
-# STEP 1: Load Data
+# STEPS 1 + 1.5 + 2a/2c: Load → Subset → PCA → Normalize
+# Performed by rank 0 only. The resulting scaled feature matrix X_np is then
+# broadcast to all other ranks. This avoids each rank loading gigabytes of
+# raw expression data independently.
 # ============================================================================
 
-print("\n" + "="*80)
-print("STEP 1: Loading Data")
-print("="*80)
+log("\n" + "=" * 80)
+log("STEP 1: Loading Data  [rank 0 only]")
+log("=" * 80)
 
 def load_converted_data(data_dir):
-    """Load data converted from RDS"""
+    """Load data converted from RDS, keeping matrices sparse."""
     data = {}
-    
-    print("Loading expression matrix...")
+
+    print("Loading expression matrix...", flush=True)
     expr_path = os.path.join(data_dir, "expression_matrix.mtx")
-    expression = mmread(expr_path).toarray()
-    print(f"  Expression: {expression.shape}")
-    
+    expression = mmread(expr_path).tocsr()
+    print(f"  Expression: {expression.shape}", flush=True)
+
     genes = pd.read_csv(os.path.join(data_dir, "genes.csv"))['gene'].tolist()
     cells = pd.read_csv(os.path.join(data_dir, "cells.csv"))['cell'].tolist()
-    print(f"  Genes: {len(genes)}, Cells: {len(cells)}")
-    
+    print(f"  Genes: {len(genes)}, Cells: {len(cells)}", flush=True)
+
     metadata = pd.read_csv(os.path.join(data_dir, "metadata.csv"), index_col=0)
-    print(f"  Metadata: {metadata.shape}")
-    
+    print(f"  Metadata: {metadata.shape}", flush=True)
+
     adj_path = os.path.join(data_dir, "adjacency_matrix.mtx")
     if os.path.exists(adj_path):
-        print("Loading adjacency matrix (sparse)...")
-        adjacency = mmread(adj_path).toarray()
-        print(f"  Adjacency: {adjacency.shape}")
+        print("Loading adjacency matrix (sparse)...", flush=True)
+        adjacency = mmread(adj_path).tocsr()
+        print(f"  Adjacency: {adjacency.shape}", flush=True)
     else:
         adjacency = None
-        print("  No adjacency matrix found")
-    
+        print("  No adjacency matrix found", flush=True)
+
     cluster_path = os.path.join(data_dir, "cluster_labels.csv")
     if os.path.exists(cluster_path):
         clusters = pd.read_csv(cluster_path)
         labels = clusters['cluster'].values
-        n_clusters = len(np.unique(labels))
-        print(f"  Cluster labels: {n_clusters} clusters")
+        print(f"  Cluster labels: {len(np.unique(labels))} clusters", flush=True)
     else:
         labels = None
-        print("  No cluster labels")
-    
+        print("  No cluster labels", flush=True)
+
     data['expression'] = expression
     data['genes'] = genes
     data['cells'] = cells
     data['metadata'] = metadata
     data['adjacency'] = adjacency
     data['labels'] = labels
-    
     return data
 
-data = load_converted_data(CONVERTED_DATA_DIR)
+# Non-main ranks sit here until the broadcast below.
+if IS_MAIN:
+    with StepTimer("Step 1: Load Data"):
+        data = load_converted_data(CONVERTED_DATA_DIR)
 
-# ============================================================================
-# STEP 1.5: APPLY SUBSETTING (THE CRITICAL STEP!)
-# ============================================================================
+    # ── Step 1.5: Subset ──────────────────────────────────────────────────────
+    log("\n" + "=" * 80)
+    log("STEP 1.5: Applying Subset")
+    log("=" * 80)
 
-print("\n" + "="*80)
-print("STEP 1.5: Applying Subset")
-print("="*80)
+    with StepTimer("Step 1.5: Subset"):
+        expression = data['expression']
+        if expression.shape[0] < expression.shape[1]:
+            log("Transposing expression matrix to (cells x genes)")
+            expression = expression.T
 
-# Transpose if needed (ensure cells x genes)
-if data['expression'].shape[0] < data['expression'].shape[1]:
-    print("Transposing expression matrix to (cells x genes)")
-    data['expression'] = data['expression'].T
+        total_cells = expression.shape[0]
+        log(f"Original data: {total_cells} cells × {len(data['genes'])} genes")
 
-total_cells = data['expression'].shape[0]
-print(f"Original data: {total_cells} cells × {len(data['genes'])} genes")
+        if USE_SUBSET and total_cells > SUBSET_SIZE:
+            log(f"\n SUBSETTING: {SUBSET_SIZE} / {total_cells} cells ({100*SUBSET_SIZE/total_cells:.1f}%)")
+            np.random.seed(RANDOM_SEED)
 
-if USE_SUBSET and total_cells > SUBSET_SIZE:
-    print(f"\n SUBSETTING: {SUBSET_SIZE} / {total_cells} cells ({100*SUBSET_SIZE/total_cells:.1f}%)")
-    print(f"Method: {SUBSET_METHOD}")
-    
-    np.random.seed(RANDOM_SEED)
-    
-    # ========================================================================
-    # METHOD 1: Random Sampling
-    # ========================================================================
-    if SUBSET_METHOD == 'random':
-        print("\nApplying random sampling...")
-        indices = np.random.choice(total_cells, size=SUBSET_SIZE, replace=False)
-        indices = np.sort(indices)  # Keep order for reproducibility
-        print(f"  Selected {len(indices)} random cells")
-    
-    # ========================================================================
-    # METHOD 2: Stratified Sampling (Balanced by Clusters)
-    # ========================================================================
-    elif SUBSET_METHOD == 'stratified' and data['labels'] is not None:
-        print("\nApplying stratified sampling (balanced by clusters)...")
-        
-        labels = data['labels']
-        unique_labels = np.unique(labels)
-        n_clusters = len(unique_labels)
-        
-        print(f"  Original: {n_clusters} clusters")
-        
-        indices_list = []
-        for label in unique_labels:
-            # Find all cells in this cluster
-            cluster_indices = np.where(labels == label)[0]
-            cluster_size = len(cluster_indices)
-            
-            # Sample proportionally to cluster size
-            n_from_cluster = max(1, int(SUBSET_SIZE * cluster_size / total_cells))
-            
-            # Don't sample more than available
-            if n_from_cluster < cluster_size:
-                sampled = np.random.choice(cluster_indices, size=n_from_cluster, replace=False)
+            if SUBSET_METHOD == 'random':
+                indices = np.sort(np.random.choice(total_cells, size=SUBSET_SIZE, replace=False))
+            elif SUBSET_METHOD == 'stratified' and data['labels'] is not None:
+                labels_arr = data['labels']
+                unique_labels = np.unique(labels_arr)
+                indices_list = []
+                for label in unique_labels:
+                    cluster_indices = np.where(labels_arr == label)[0]
+                    n_from = max(1, int(SUBSET_SIZE * len(cluster_indices) / total_cells))
+                    sampled = (np.random.choice(cluster_indices, size=n_from, replace=False)
+                               if n_from < len(cluster_indices) else cluster_indices)
+                    indices_list.append(sampled)
+                    log(f"    Cluster {label}: {len(sampled)}/{len(cluster_indices)} cells")
+                indices = np.sort(np.concatenate(indices_list))
             else:
-                sampled = cluster_indices
-            
-            indices_list.append(sampled)
-            print(f"    Cluster {label}: {len(sampled)}/{cluster_size} cells")
-        
-        # Combine all sampled indices
-        indices = np.concatenate(indices_list)
-        indices = np.sort(indices)
-        print(f"\n  Total selected: {len(indices)} cells from {n_clusters} clusters")
-    
+                log("Falling back to random sampling...")
+                indices = np.sort(np.random.choice(total_cells, size=SUBSET_SIZE, replace=False))
+
+            expression = expression[indices, :]
+            data['cells'] = [data['cells'][i] for i in indices]
+            data['metadata'] = data['metadata'].iloc[indices].copy()
+            if data['adjacency'] is not None:
+                data['adjacency'] = data['adjacency'][indices][:, indices]
+            if data['labels'] is not None:
+                data['labels'] = data['labels'][indices]
+            log(f"\n SUBSET APPLIED: {expression.shape[0]} cells × {expression.shape[1]} genes")
+        else:
+            log("Using full dataset")
+
+        total_cells = expression.shape[0]
+
+    # ── Step 2a: PCA (sparse-safe TruncatedSVD) ───────────────────────────────
+    log("\n" + "=" * 80)
+    log("STEP 2: PCA + Normalize  [rank 0 only — result broadcast to all ranks]")
+    log("=" * 80)
+
+    n_cells_local, n_genes = expression.shape
+    log(f"Working with: {n_cells_local} cells × {n_genes} genes")
+
+    if n_genes > N_PCS:
+        with StepTimer("Step 2a: PCA"):
+            log(f"\nApplying TruncatedSVD (sparse PCA): {n_genes} genes → {N_PCS} PCs")
+            svd = TruncatedSVD(n_components=N_PCS, random_state=42)
+            X_np = svd.fit_transform(expression)  # expression stays sparse
+            log(f"  Variance explained: {svd.explained_variance_ratio_.sum():.1%}")
+            log(f"  PCA embedding shape: {X_np.shape}")
     else:
-        # Fallback to random if stratified requested but no labels
-        print("\nStratified sampling requested but no labels available")
-        print("Falling back to random sampling...")
-        indices = np.random.choice(total_cells, size=SUBSET_SIZE, replace=False)
-        indices = np.sort(indices)
-        print(f"  Selected {len(indices)} random cells")
-    
-    # ========================================================================
-    # APPLY THE SUBSET TO ALL DATA
-    # ========================================================================
-    print("\nApplying subset to data structures...")
-    
-    # Expression matrix
-    print(f"  Expression: {data['expression'].shape} → ", end='')
-    data['expression'] = data['expression'][indices, :]
-    print(f"{data['expression'].shape}")
-    
-    # Cell names
-    print(f"  Cells: {len(data['cells'])} → ", end='')
-    data['cells'] = [data['cells'][i] for i in indices]
-    print(f"{len(data['cells'])}")
-    
-    # Metadata
-    print(f"  Metadata: {data['metadata'].shape} → ", end='')
-    data['metadata'] = data['metadata'].iloc[indices].copy()
-    print(f"{data['metadata'].shape}")
-    
-    # Adjacency matrix (if exists)
-    if data['adjacency'] is not None:
-        print(f"  Adjacency: {data['adjacency'].shape} → ", end='')
-        # CRITICAL: Subset both rows AND columns
-        data['adjacency'] = data['adjacency'][indices][:, indices]
-        print(f"{data['adjacency'].shape}")
-    
-    # Labels (if exist)
+        log("\nUsing raw expression (n_genes <= N_PCS)")
+        X_np = expression.toarray() if issparse(expression) else expression
+
+    with StepTimer("Step 2c: Normalize"):
+        log("\nNormalizing features...")
+        scaler = StandardScaler()
+        X_np = scaler.fit_transform(X_np).astype(np.float32)
+        log("  Features normalized (mean=0, std=1)")
+
+    # Build true_labels on rank 0
+    true_labels = None
     if data['labels'] is not None:
-        print(f"  Labels: {len(data['labels'])} → ", end='')
-        data['labels'] = data['labels'][indices]
-        print(f"{len(data['labels'])}")
-    
-    print(f"\n SUBSET APPLIED SUCCESSFULLY")
-    print(f"   New data size: {data['expression'].shape[0]} cells × {data['expression'].shape[1]} genes")
+        labels_arr = data['labels']
+        unique_labels = np.unique(labels_arr)
+        n_clusters = len(unique_labels)
+        log(f"\nProcessing labels: {n_clusters} clusters")
+        if n_clusters > 20:
+            from sklearn.cluster import KMeans
+            n_top = max(5, n_clusters // 4)
+            log(f"  Creating 2-level hierarchy: {n_top} (top) / {n_clusters} (middle)")
+            labels_top = KMeans(n_clusters=n_top, random_state=42, n_init=10).fit_predict(X_np)
+            true_labels = [labels_top, labels_arr]
+        else:
+            log(f"  Using single level: {n_clusters} clusters")
+            true_labels = [labels_arr]
 
+    _broadcast_meta = [X_np.shape[0], X_np.shape[1], total_cells, true_labels]
 else:
-    if not USE_SUBSET:
-        print("\n  Subset disabled (USE_SUBSET=False)")
-        print("   Using all data")
-    else:
-        print(f"\n  Requested subset size ({SUBSET_SIZE}) >= total cells ({total_cells})")
-        print("   Using all data")
+    X_np = None
+    _broadcast_meta = [None, None, None, None]
+    total_cells = 0
 
-# ============================================================================
-# STEP 2: Prepare Data
-# ============================================================================
+# ── Broadcast scaled PCA embedding from rank 0 to all ranks ──────────────────
+# X_np is ~n_cells × 50 float32 (a few MB). Each rank then independently
+# computes A from the same X_np — embarrassingly parallel graph construction.
+if WORLD_SIZE > 1:
+    dist.broadcast_object_list(_broadcast_meta, src=0)
+    n_cells_bc, n_features_bc, total_cells, true_labels = _broadcast_meta
 
-print("\n" + "="*80)
-print("STEP 2: Preparing Data")
-print("="*80)
+    if not IS_MAIN:
+        X_np = np.empty((n_cells_bc, n_features_bc), dtype=np.float32)
+    X_t = torch.from_numpy(X_np)
+    dist.broadcast(X_t, src=0)
+    if not IS_MAIN:
+        X_np = X_t.numpy()
 
-expression = data['expression']
-n_cells, n_genes = expression.shape
-print(f"Working with: {n_cells} cells × {n_genes} genes")
+log(f"\nAll ranks have X: {X_np.shape}")
 
-# PCA
-if USE_PCA and n_genes > N_PCS:
-    print(f"\nApplying PCA: {n_genes} genes → {N_PCS} PCs")
-    pca = PCA(n_components=N_PCS, random_state=42)
-    X = pca.fit_transform(expression)
-    var_explained = pca.explained_variance_ratio_.sum()
-    print(f"  Variance explained: {var_explained:.1%}")
-else:
-    print("\nUsing raw expression")
-    X = expression
+# ── Step 2d: Build Graph  [all ranks in parallel] ─────────────────────────────
+# All ranks received the same X_np, so get_input_graph is deterministic and
+# produces the same A on every rank simultaneously — no serialisation needed.
+log("\n" + "=" * 80)
+log("STEP 2d: Build Graph  [all ranks in parallel]")
+log("=" * 80)
 
-# Normalize
-print("\nNormalizing features...")
-scaler = StandardScaler()
-X = scaler.fit_transform(X)
-print(f"  Features normalized (mean=0, std=1)")
+with StepTimer(f"Step 2d: Build Graph [rank {RANK}]"):
+    log("\nBuilding graph from PCA features...")
+    A_graph, A_np = get_input_graph(X=X_np, method='Correlation', K=K_NEIGHBORS, metric='1-R^2')
 
-# Build or use adjacency
-if data['adjacency'] is not None and data['adjacency'].shape[0] == n_cells:
+log(f"  Graph: {A_graph.number_of_nodes()} nodes, {A_graph.number_of_edges()} edges")
+log(f"  Adjacency density: {A_np.sum() / (X_np.shape[0]**2):.4f}")
 
-    print("\nUsing provided adjacency matrix from Seurat...")
-    A_graph, A = get_input_graph(X=X, method='KNN', K=K_NEIGHBORS)
-
-
-else:
-    print("\nBuilding KNN graph from PCA features...")
-    A_graph, A = get_input_graph(
-        X=X,                # numpy array (n_cells x n_pcs)
-        method='KNN',
-        K=K_NEIGHBORS,     
-        metric='1-R^2'      
-    )
- 
-
-print(f"  Graph: {A_graph.number_of_nodes()} nodes, {A_graph.number_of_edges()} edges")
-print(f"  Adjacency density: {A.sum() / (n_cells**2):.4f}")
-
-# --- Convert to tensor and add self-loops ---
-A = torch.FloatTensor(A)
-A = A + torch.eye(A.shape[0])
-   # self-loops so every node attends to itself
-A = torch.clamp(A, 0, 1)        # ensure binary after self-loop addition
-
-print(f"  A tensor: {A.shape}, non-zero: {(A > 0).sum().item()}")
-# Convert to PyTorch tensors
-X = torch.FloatTensor(X)
-A = torch.FloatTensor(A)
-
+A = torch.clamp(torch.FloatTensor(A_np) + torch.eye(X_np.shape[0]), 0, 1)
+X = torch.FloatTensor(X_np)
 nodes, features = X.shape
+log(f"\nPrepared tensors [rank {RANK}]: X={X.shape}, A={A.shape}")
 
-print(f"\nPrepared tensors:")
-print(f"  X: {X.shape}")
-print(f"  A: {A.shape}")
-
-# Verify the subset worked!
-assert nodes == SUBSET_SIZE or (not USE_SUBSET or total_cells <= SUBSET_SIZE), \
-    f"Subset failed! Expected {SUBSET_SIZE} nodes, got {nodes}"
-
-# Process labels
-true_labels = None
-if data['labels'] is not None:
-    labels = data['labels']
-    unique_labels = np.unique(labels)
-    n_clusters = len(unique_labels)
-    
-    print(f"\nProcessing labels: {n_clusters} clusters")
-    
-    if n_clusters > 20:
-        from sklearn.cluster import KMeans
-        n_top = max(5, n_clusters // 4)
-        print(f"  Creating 2-level hierarchy: {n_top} (top) / {n_clusters} (middle)")
-        
-        kmeans_top = KMeans(n_clusters=n_top, random_state=42, n_init=10)
-        labels_top = kmeans_top.fit_predict(X.numpy())
-        
-        true_labels = [labels_top, labels]
-    else:
-        print(f"  Using single level: {n_clusters} clusters")
-        true_labels = [labels]
+assert (not USE_SUBSET or total_cells <= SUBSET_SIZE or nodes >= SUBSET_SIZE * 0.9), \
+    f"Subset failed! Expected ~{SUBSET_SIZE} nodes, got {nodes}"
 
 # ============================================================================
-# STEP 3: Estimate Community Sizes
+# STEP 3: Estimate Community Sizes  [rank 0 computes, all ranks receive]
 # ============================================================================
 
-print("\n" + "="*80)
-print("STEP 3: Estimating Community Sizes")
-print("="*80)
+log("\n" + "=" * 80)
+log("STEP 3: Estimating Community Sizes")
+log("=" * 80)
 
-try:
-    comm_middle, comm_top = compute_kappa(X, A, method='bethe_hessian', verbose=True)
-    comm_sizes = [comm_middle, comm_top]
-    print(f"Bethe-Hessian: Top={comm_top}, Middle={comm_middle}")
-except Exception as e:
-    print(f"Bethe-Hessian failed: {e}")
-    comm_top = max(10, nodes // 200)
-    comm_middle = max(20, nodes // 50)
-    comm_sizes = [comm_middle, comm_top]
-    print(f"Using heuristic: Top={comm_top}, Middle={comm_middle}")
+_comm_list = [None]
+if IS_MAIN:
+    with StepTimer("Step 3: Community Size Estimation"):
+        try:
+            comm_middle, comm_top = compute_kappa(X, A, method='bethe_hessian', verbose=True)
+            comm_sizes = [comm_middle, comm_top]
+            log(f"Bethe-Hessian: Top={comm_top}, Middle={comm_middle}")
+        except Exception as e:
+            log(f"Bethe-Hessian failed: {e}")
+            comm_top = max(10, nodes // 200)
+            comm_middle = max(20, nodes // 50)
+            comm_sizes = [comm_middle, comm_top]
+            log(f"Using heuristic: Top={comm_top}, Middle={comm_middle}")
+    _comm_list = [comm_sizes]
+
+if WORLD_SIZE > 1:
+    dist.broadcast_object_list(_comm_list, src=0)
+comm_sizes = _comm_list[0]
 
 # ============================================================================
-# STEP 4: Create Model & Auto-Adjust Hyperparameters
+# STEP 4: Create Model  [all ranks — identical architecture, wrapped in DDP]
 # ============================================================================
 
-print("\n" + "="*80)
-print("STEP 4: Creating Model")
-print("="*80)
+log("\n" + "=" * 80)
+log("STEP 4: Creating Model")
+log("=" * 80)
 
-# Auto-adjust hyperparameters based on subset size
 if nodes < 1000:
-    LEARNING_RATE = 1e-3
-    BATCH_SIZE = 64
-    EPOCHS = 200
-    print(f"Small dataset (<1K): LR={LEARNING_RATE}, Batch={BATCH_SIZE}, Epochs={EPOCHS}")
+    LEARNING_RATE, BATCH_SIZE, EPOCHS = 1e-3, 64, 200
+    log(f"Small dataset (<1K): LR={LEARNING_RATE}, Batch={BATCH_SIZE}, Epochs={EPOCHS}")
 elif nodes < 5000:
-    LEARNING_RATE = 1e-4
-    BATCH_SIZE = 128
-    EPOCHS = 150
-    print(f"Medium dataset (1-5K): LR={LEARNING_RATE}, Batch={BATCH_SIZE}, Epochs={EPOCHS}")
+    LEARNING_RATE, BATCH_SIZE, EPOCHS = 1e-4, 128, 150
+    log(f"Medium dataset (1-5K): LR={LEARNING_RATE}, Batch={BATCH_SIZE}, Epochs={EPOCHS}")
 elif nodes < 10000:
-    LEARNING_RATE = 1e-5
-    BATCH_SIZE = 256
-    EPOCHS = 100
-    print(f"Large dataset (5-10K): LR={LEARNING_RATE}, Batch={BATCH_SIZE}, Epochs={EPOCHS}")
+    LEARNING_RATE, BATCH_SIZE, EPOCHS = 1e-5, 256, 100
+    log(f"Large dataset (5-10K): LR={LEARNING_RATE}, Batch={BATCH_SIZE}, Epochs={EPOCHS}")
 else:
-    LEARNING_RATE = 1e-5
-    BATCH_SIZE = 512
-    EPOCHS = 100
-    print(f"Very large dataset (>10K): LR={LEARNING_RATE}, Batch={BATCH_SIZE}, Epochs={EPOCHS}")
+    LEARNING_RATE, BATCH_SIZE, EPOCHS = 1e-5, 512, 100
+    log(f"Very large dataset (>10K): LR={LEARNING_RATE}, Batch={BATCH_SIZE}, Epochs={EPOCHS}")
 
 EARLY_STOPPING = True
 PATIENCE = 10
 
-model = HCD(
-    nodes=nodes,
-    attrib=features,
-    method='top_down',
-    ae_hidden_dims=[128, 64, 32],
-    ll_hidden_dims=[32, 32],
-    comm_sizes=comm_sizes,
-    ae_operator='GATv2Conv',
-    comm_operator='Linear',
-    dropout=0.3,
-    use_output_layers=True,
-    normalize_input=True,
-    normalize_outputs=True,
-    ae_attn_heads=2
-).to(DEVICE)
+with StepTimer("Step 4: Model Creation"):
+    model = HCD(
+        nodes=nodes,
+        attrib=features,
+        method='top_down',
+        ae_hidden_dims=[128, 64, 32],
+        ll_hidden_dims=[32, 32],
+        comm_sizes=comm_sizes,
+        ae_operator='GATv2Conv',
+        comm_operator='Linear',
+        dropout=0.3,
+        use_output_layers=True,
+        normalize_input=True,
+        normalize_outputs=True,
+        ae_attn_heads=2
+    ).to(DEVICE)
+
+    if WORLD_SIZE > 1:
+        device_ids = [RANK % torch.cuda.device_count()] if torch.cuda.is_available() else None
+        model = DDP(model, device_ids=device_ids)
+        log(f"  Model wrapped in DistributedDataParallel (world_size={WORLD_SIZE})")
 
 n_params = sum(p.numel() for p in model.parameters())
-print(f"Model: {n_params:,} parameters")
+log(f"Model: {n_params:,} parameters")
 
 # ============================================================================
-# STEP 5: Train
+# STEP 5: Train  [all ranks — DDP synchronises gradients automatically]
 # ============================================================================
 
-print("\n" + "="*80)
-print("STEP 5: Training Model")
-print("="*80)
+log("\n" + "=" * 80)
+log("STEP 5: Training Model")
+log("=" * 80)
 
 trainer = Trainer(
     model=model,
@@ -415,177 +425,197 @@ trainer = Trainer(
     use_batch_learning=True,
     true_labels=true_labels,
     output_path=OUTPUT_PATH,
-    save_output=True,
-    use_logging=True,
-    log_to_file=True,
-    verbose=True
+    save_output=IS_MAIN,
+    use_logging=IS_MAIN,
+    log_to_file=IS_MAIN,
+    verbose=IS_MAIN
 )
 
-print("Starting training...\n")
-output = trainer.fit(DEVICE)
+log("Starting training...\n")
+if WORLD_SIZE > 1:
+    dist.barrier()   # ensure all ranks enter training together
+reset_forward_timing()
+with StepTimer("Step 5: Training"):
+    output = trainer.fit(DEVICE)
+if WORLD_SIZE > 1:
+    dist.barrier()   # wait for all ranks before saving
+
+_gate_encoder_s = forward_timing['gate_encoder']
+_gate_decoder_s = forward_timing['gate_decoder']
+_clustering_s   = forward_timing['clustering']
+_forward_calls  = forward_timing['calls']
 
 # ============================================================================
-# STEP 6: Save Results
+# STEPS 6 & 7: Save Results + Heatmaps  [rank 0 only]
 # ============================================================================
 
-print("\n" + "="*80)
-print("TRAINING COMPLETE!")
-print("="*80)
+if IS_MAIN:
+    log("\n" + "=" * 80)
+    log("TRAINING COMPLETE!")
+    log("=" * 80)
 
-if output.train_loss_history:
-    final_loss = output.train_loss_history[-1]['Total Loss']
-    print(f"\nFinal training loss: {final_loss:.4f}")
+    if output.train_loss_history:
+        log(f"\nFinal training loss: {output.train_loss_history[-1]['Total Loss']:.4f}")
 
-if output.performance_history:
-    final_perf = None
-    for perf in reversed(output.performance_history):
-        if perf is not None:
-            final_perf = perf
-            break
-    
-    if final_perf:
-        print(f"\nPerformance Metrics:")
-        for i, perf in enumerate(final_perf):
-            if perf is not None:
-                layer = 'Top' if i == 0 else 'Middle'
-                print(f"  {layer}: H={perf[0]:.3f}, C={perf[1]:.3f}, NMI={perf[2]:.3f}, ARI={perf[3]:.3f}")
+    if output.performance_history:
+        final_perf = next((p for p in reversed(output.performance_history) if p is not None), None)
+        if final_perf:
+            log("\nPerformance Metrics:")
+            for i, perf in enumerate(final_perf):
+                if perf is not None:
+                    layer = 'Top' if i == 0 else 'Middle'
+                    log(f"  {layer}: H={perf[0]:.3f}, C={perf[1]:.3f}, NMI={perf[2]:.3f}, ARI={perf[3]:.3f}")
 
-# Save model
-MODEL_PATH = os.path.join(OUTPUT_PATH, 'trained_model.pth')
-torch.save({
-    'model_state_dict': model.state_dict(),
-    'comm_sizes': comm_sizes,
-    'subset_size': nodes,
-    'config': {
-        'method': 'top_down',
-        'ae_hidden_dims': [128, 64, 32],
-        'comm_operator': 'Linear',
-        'dropout': 0.3
-    }
-}, MODEL_PATH)
-print(f"\n✓ Model saved: {MODEL_PATH}")
+    with StepTimer("Step 6: Save Results"):
+        # Unwrap DDP to get the underlying module for state_dict
+        save_model = model.module if isinstance(model, DDP) else model
+        MODEL_PATH = os.path.join(OUTPUT_PATH, 'trained_model.pth')
+        torch.save({
+            'model_state_dict': save_model.state_dict(),
+            'comm_sizes': comm_sizes,
+            'subset_size': nodes,
+            'config': {
+                'method': 'top_down',
+                'ae_hidden_dims': [128, 64, 32],
+                'comm_operator': 'Linear',
+                'dropout': 0.3
+            }
+        }, MODEL_PATH)
+        log(f"\n✓ Model saved: {MODEL_PATH}")
 
-# Save predictions
-if hasattr(output, 'predicted_train'):
-    pred_path = os.path.join(OUTPUT_PATH, 'predictions.csv')
-    top_preds = output.predicted_train['top'].cpu().numpy() if 'top' in output.predicted_train else None
-    mid_preds = output.predicted_train['middle'].cpu().numpy() if 'middle' in output.predicted_train else None
-    n_preds = len(top_preds) if top_preds is not None else (len(mid_preds) if mid_preds is not None else len(data['cells']))
-    cells_for_pred = data['cells'][:n_preds]
-    pred_df = pd.DataFrame({
-        'cell': cells_for_pred,
-        'top_cluster': top_preds if top_preds is not None else [None] * n_preds,
-        'middle_cluster': mid_preds if mid_preds is not None else [None] * n_preds,
-    })
-    pred_df.to_csv(pred_path, index=False)
-    print(f"✓ Predictions saved: {pred_path}")
+        if hasattr(output, 'predicted_train'):
+            pred_path = os.path.join(OUTPUT_PATH, 'predictions.csv')
+            top_preds = output.predicted_train['top'].cpu().numpy() if 'top' in output.predicted_train else None
+            mid_preds = output.predicted_train['middle'].cpu().numpy() if 'middle' in output.predicted_train else None
+            n_preds = (len(top_preds) if top_preds is not None else
+                       len(mid_preds) if mid_preds is not None else len(data['cells']))
+            pred_df = pd.DataFrame({
+                'cell': data['cells'][:n_preds],
+                'top_cluster': top_preds if top_preds is not None else [None] * n_preds,
+                'middle_cluster': mid_preds if mid_preds is not None else [None] * n_preds,
+            })
+            pred_df.to_csv(pred_path, index=False)
+            log(f"✓ Predictions saved: {pred_path}")
 
-# Save timing
-end_time = time.perf_counter()
-elapsed = end_time - start_time
+    # ── Heatmaps ──────────────────────────────────────────────────────────────
+    with StepTimer("Step 7: Heatmaps"):
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import seaborn as sns
 
-time_file = os.path.join(OUTPUT_PATH, "execution_time.txt")
-with open(time_file, "w") as f:
-    f.write(f"Execution time: {elapsed:.1f} seconds ({elapsed/60:.1f} minutes)\n")
-    f.write(f"Subset size: {nodes} cells\n")
-    f.write(f"Subset method: {SUBSET_METHOD}\n")
+            if not hasattr(output, 'predicted_train'):
+                pred_df = pd.read_csv(pred_path)
+                _n = len(pred_df)
+            else:
+                _top = output.predicted_train['top'].cpu().numpy() if 'top' in output.predicted_train else None
+                _mid = output.predicted_train['middle'].cpu().numpy() if 'middle' in output.predicted_train else None
+                _n = (len(_top) if _top is not None else
+                      len(_mid) if _mid is not None else len(data['cells']))
+                pred_df = pd.DataFrame({
+                    'cell': data['cells'][:_n],
+                    'top_cluster': _top if _top is not None else [None] * _n,
+                    'middle_cluster': _mid if _mid is not None else [None] * _n,
+                })
 
-print(f"✓ Timing saved: {time_file}")
+            X_np_plot = X.numpy()[:_n]
 
-# ============================================================================
-# HEATMAPS
-# ============================================================================
-try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import seaborn as sns
+            sorted_df = pred_df.dropna(subset=['top_cluster']).sort_values(['top_cluster', 'middle_cluster'])
+            sorted_idx = sorted_df.index.to_numpy()
+            corr_matrix = np.corrcoef(X_np_plot[sorted_idx])
 
-    if not hasattr(output, 'predicted_train'):
-        pred_df = pd.read_csv(pred_path)
-    else:
-        _top = output.predicted_train['top'].cpu().numpy() if 'top' in output.predicted_train else None
-        _mid = output.predicted_train['middle'].cpu().numpy() if 'middle' in output.predicted_train else None
-        _n = len(_top) if _top is not None else (len(_mid) if _mid is not None else len(data['cells']))
-        pred_df = pd.DataFrame({
-            'cell': data['cells'][:_n],
-            'top_cluster': _top if _top is not None else [None] * _n,
-            'middle_cluster': _mid if _mid is not None else [None] * _n,
-        })
+            fig, ax = plt.subplots(figsize=(10, 9))
+            sns.heatmap(corr_matrix, ax=ax, cmap='coolwarm', center=0, vmin=-1, vmax=1,
+                        xticklabels=False, yticklabels=False,
+                        cbar_kws={'label': 'Pearson Correlation'})
+            top_clusters = sorted_df['top_cluster'].values
+            for b in np.where(np.diff(top_clusters))[0] + 1:
+                ax.axhline(b, color='black', linewidth=1.2, linestyle='--')
+                ax.axvline(b, color='black', linewidth=1.2, linestyle='--')
+            ax.set_title('Cell-Cell Correlation (sorted by Top Cluster)')
+            ax.set_xlabel('Cells')
+            ax.set_ylabel('Cells')
+            plt.tight_layout()
+            heatmap1_path = os.path.join(OUTPUT_PATH, 'heatmap_cell_correlation.png')
+            plt.savefig(heatmap1_path, dpi=150)
+            plt.close()
+            log(f"✓ Cell-cell correlation heatmap saved: {heatmap1_path}")
 
-    X_np = X.numpy()[:_n]  # align with predicted cells
+            for cluster_level, cluster_col in [('top', 'top_cluster'), ('middle', 'middle_cluster')]:
+                co = pred_df.dropna(subset=[cluster_col])
+                if len(co) == 0:
+                    continue
+                cluster_ids = sorted(co[cluster_col].astype(int).unique())
+                cluster_means = np.stack([
+                    X_np_plot[co[co[cluster_col].astype(int) == c].index].mean(axis=0)
+                    for c in cluster_ids
+                ])
+                inter_corr = np.corrcoef(cluster_means)
+                fig, ax = plt.subplots(figsize=(max(6, len(cluster_ids)), max(5, len(cluster_ids) - 1)))
+                sns.heatmap(inter_corr, ax=ax, cmap='coolwarm', center=0, vmin=-1, vmax=1,
+                            annot=True, fmt='.2f',
+                            xticklabels=[f'C{c}' for c in cluster_ids],
+                            yticklabels=[f'C{c}' for c in cluster_ids],
+                            cbar_kws={'label': 'Pearson Correlation'})
+                ax.set_title(f'Inter-Cluster Correlation ({cluster_level.capitalize()} level)')
+                plt.tight_layout()
+                heatmap2_path = os.path.join(OUTPUT_PATH, f'heatmap_cluster_corr_{cluster_level}.png')
+                plt.savefig(heatmap2_path, dpi=150)
+                plt.close()
+                log(f"✓ Cluster correlation heatmap saved: {heatmap2_path}")
 
-    # ── 1. Cell-cell correlation heatmap sorted by cluster ────────────────
-    sorted_df = pred_df.dropna(subset=['top_cluster']).sort_values(['top_cluster', 'middle_cluster'])
-    sorted_idx = sorted_df.index.to_numpy()
-    X_sorted = X_np[sorted_idx]
+        except Exception as e:
+            log(f"⚠ Heatmap generation failed: {e}")
 
-    # Pearson correlation between every pair of cells
-    corr_matrix = np.corrcoef(X_sorted)
+    # ── Timing & memory summary ────────────────────────────────────────────────
+    tracemalloc.stop()
+    end_time = time.perf_counter()
+    elapsed = end_time - start_time
 
-    fig, ax = plt.subplots(figsize=(10, 9))
-    sns.heatmap(
-        corr_matrix,
-        ax=ax,
-        cmap='coolwarm',
-        center=0,
-        vmin=-1, vmax=1,
-        xticklabels=False,
-        yticklabels=False,
-        cbar_kws={'label': 'Pearson Correlation'}
-    )
-    top_clusters = sorted_df['top_cluster'].values
-    boundaries = np.where(np.diff(top_clusters))[0] + 1
-    for b in boundaries:
-        ax.axhline(b, color='black', linewidth=1.2, linestyle='--')
-        ax.axvline(b, color='black', linewidth=1.2, linestyle='--')
-    ax.set_title('Cell-Cell Correlation (sorted by Top Cluster)')
-    ax.set_xlabel('Cells')
-    ax.set_ylabel('Cells')
-    plt.tight_layout()
-    heatmap1_path = os.path.join(OUTPUT_PATH, 'heatmap_cell_correlation.png')
-    plt.savefig(heatmap1_path, dpi=150)
-    plt.close()
-    print(f"✓ Cell-cell correlation heatmap saved: {heatmap1_path}")
+    _step_times["  ↳ GATE Encoder (total)"] = (_gate_encoder_s, None)
+    _step_times["  ↳ GATE Decoder (total)"] = (_gate_decoder_s, None)
+    _step_times["  ↳ Clustering (total)"]   = (_clustering_s,   None)
+    _step_times[f"  ↳ forward() calls"]     = (_forward_calls,  None)
 
-    # ── 2. Inter-cluster mean correlation heatmap ─────────────────────────
-    for cluster_level, cluster_col in [('top', 'top_cluster'), ('middle', 'middle_cluster')]:
-        co = pred_df.dropna(subset=[cluster_col])
-        if len(co) == 0:
-            continue
-        cluster_ids = sorted(co[cluster_col].astype(int).unique())
-        # Mean expression vector per cluster
-        cluster_means = np.stack([
-            X_np[co[co[cluster_col].astype(int) == c].index].mean(axis=0)
-            for c in cluster_ids
-        ])
-        inter_corr = np.corrcoef(cluster_means)
-        fig, ax = plt.subplots(figsize=(max(6, len(cluster_ids)), max(5, len(cluster_ids) - 1)))
-        sns.heatmap(
-            inter_corr,
-            ax=ax,
-            cmap='coolwarm',
-            center=0,
-            vmin=-1, vmax=1,
-            annot=True, fmt='.2f',
-            xticklabels=[f'C{c}' for c in cluster_ids],
-            yticklabels=[f'C{c}' for c in cluster_ids],
-            cbar_kws={'label': 'Pearson Correlation'}
-        )
-        ax.set_title(f'Inter-Cluster Correlation ({cluster_level.capitalize()} level)')
-        plt.tight_layout()
-        heatmap2_path = os.path.join(OUTPUT_PATH, f'heatmap_cluster_corr_{cluster_level}.png')
-        plt.savefig(heatmap2_path, dpi=150)
-        plt.close()
-        print(f"✓ Cluster correlation heatmap saved: {heatmap2_path}")
+    time_file = os.path.join(OUTPUT_PATH, "execution_time.txt")
+    with open(time_file, "w") as _tf:
+        _tf.write(f"Total execution time: {elapsed:.1f}s ({elapsed/60:.1f} min)\n")
+        _tf.write(f"Subset size: {nodes} cells ({SUBSET_METHOD})\n")
+        _tf.write(f"World size: {WORLD_SIZE} processes\n\n")
+        _tf.write(f"{'Step':<45} {'Time':>10}  {'Peak MB':>10}\n")
+        _tf.write("-" * 70 + "\n")
+        for _name, (_val, _mb) in _step_times.items():
+            if _name.startswith("  ↳ forward"):
+                _tf.write(f"  {'↳ forward() calls':<43} {int(_val):>10}\n")
+            elif _name.startswith("  ↳"):
+                _tf.write(f"{_name:<45} {_fmt(_val):>10}\n")
+            else:
+                _mb_str = f"{_mb:.1f}" if _mb is not None else "  n/a"
+                _tf.write(f"{_name:<45} {_fmt(_val):>10}  {_mb_str:>10}\n")
+        _tf.write("-" * 70 + "\n")
+        _tf.write(f"{'TOTAL':<45} {_fmt(elapsed):>10}\n")
+    log(f"✓ Timing saved: {time_file}")
 
-except Exception as e:
-    print(f"⚠ Heatmap generation failed: {e}")
+    log("\n" + "=" * 80)
+    log("SUMMARY")
+    log("=" * 80)
+    log(f"✓ World size: {WORLD_SIZE} processes")
+    log(f"✓ Trained on {nodes} / {total_cells} cells ({100*nodes/total_cells:.1f}%)")
+    log(f"\n{'Step':<45} {'Time':>10}  {'Peak MB':>10}")
+    log("-" * 70)
+    for _name, (_val, _mb) in _step_times.items():
+        if _name.startswith("  ↳ forward"):
+            log(f"  {'↳ forward() calls':<43} {int(_val):>10}")
+        elif _name.startswith("  ↳"):
+            log(f"{_name:<45} {_fmt(_val):>10}")
+        else:
+            _mb_str = f"{_mb:.1f}" if _mb is not None else "  n/a"
+            log(f"{_name:<45} {_fmt(_val):>10}  {_mb_str:>10}")
+    log("-" * 70)
+    log(f"{'TOTAL':<45} {_fmt(elapsed):>10}")
+    log(f"\n✓ Results: {OUTPUT_PATH}")
+    log("=" * 80)
 
-print("\n" + "="*80)
-print("SUMMARY")
-print("="*80)
-print(f"✓ Trained on {nodes} / {total_cells} cells ({100*nodes/total_cells:.1f}%)")
-print(f"✓ Time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
-print(f"✓ Results: {OUTPUT_PATH}")
-print("="*80)
+if WORLD_SIZE > 1:
+    dist.destroy_process_group()

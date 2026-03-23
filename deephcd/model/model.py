@@ -9,6 +9,22 @@ from torch_kmeans import SoftKMeans
 from typing import Optional, Union, List,  Literal
 import numpy as np
 import os
+import time
+
+# Accumulated timing across all forward() calls (reset by training script between epochs)
+forward_timing = {
+    'gate_encoder': 0.0,
+    'gate_decoder': 0.0,
+    'clustering': 0.0,
+    'calls': 0,
+}
+
+def reset_forward_timing():
+    """Reset accumulated forward-pass timing stats."""
+    forward_timing['gate_encoder'] = 0.0
+    forward_timing['gate_decoder'] = 0.0
+    forward_timing['clustering'] = 0.0
+    forward_timing['calls'] = 0
 
 
 def select_class(X: torch.Tensor, labels: torch.Tensor, k: int, dim: int = 0, return_index: bool = False):
@@ -325,21 +341,26 @@ class HCD(nn.Module):
         H = self.input_norm(X)
         
         #get embedding representation
+        _t0 = time.perf_counter()
         Z, A, encoder_attention_weights = self.encoder(H,A)
-        
+        forward_timing['gate_encoder'] += time.perf_counter() - _t0
+
         # Normalize embeddings before dot product
         Z_norm = F.normalize(Z, p=2, dim=1)
         #find other normalize functions
         sim = torch.mm(Z_norm, Z_norm.T)
         A_hat = self.dpd_act(sim)
         sim = torch.clamp(sim, -10, 10)
-        
+
 
         A_logits = self.dpd_norm(torch.mm(Z, Z.transpose(0,1)))
-        #A_hat = self.dpd_act(self.dpd_norm(torch.mm(Z, Z.transpose(0,1))))        
+        #A_hat = self.dpd_act(self.dpd_norm(torch.mm(Z, Z.transpose(0,1))))
         #get reconstructed adjacency
+        _t0 = time.perf_counter()
         X_hat, A, decoder_attention_weights = self.decoder(Z, A)
-        
+        forward_timing['gate_decoder'] += time.perf_counter() - _t0
+
+        _t_clust = time.perf_counter()
         #bottom up method
         if self.method == 'bottom_up':
             subsets_X = []
@@ -429,6 +450,9 @@ class HCD(nn.Module):
                         S_final = reorganize_labels(S1 = S[0], S2_list= S_temp)
                         S_all = [S[0], S_final]
                 
+        forward_timing['clustering'] += time.perf_counter() - _t_clust
+        forward_timing['calls'] += 1
+
         A_all_final = [A]+[A_all]+[subsets_A]
         X_all_final = [Z]+[X_all]+[subsets_X]
         return X_hat, A_hat, A_logits, X_all_final, A_all_final, P_all, S_all, {'encoder': [[i.cpu() for i in j] for j in encoder_attention_weights], 'decoder': [[i.cpu() for i in j] for j in decoder_attention_weights]}
