@@ -32,7 +32,13 @@ from sklearn.neighbors import kneighbors_graph
 import time
 import tracemalloc
 
-from deephcd.model.model import HCD, forward_timing, reset_forward_timing
+from deephcd.model.model import HCD
+try:
+    from deephcd.model.model import forward_timing, reset_forward_timing
+except ImportError:
+    forward_timing = {'gate_encoder': 0.0, 'gate_decoder': 0.0, 'clustering': 0.0, 'calls': 0}
+    def reset_forward_timing():
+        pass
 from deephcd.model.train import Trainer
 from deephcd.utils.utilities import compute_kappa
 from deephcd.utils.utilities import get_input_graph
@@ -41,17 +47,40 @@ from deephcd.utils.utilities import get_input_graph
 
 def _init_distributed():
     """
-    Initialize torch.distributed when running under torchrun or MPI.
+    Initialize torch.distributed. Supports three launchers:
+      - torchrun:  sets RANK + WORLD_SIZE automatically
+      - srun/SLURM: sets SLURM_PROCID + SLURM_NTASKS
+      - mpirun:    sets OMPI_COMM_WORLD_RANK
     Falls back to (rank=0, world_size=1) for plain `python` launches.
     """
-    is_distributed = (
-        dist.is_available() and
-        ('RANK' in os.environ or 'OMPI_COMM_WORLD_RANK' in os.environ)
-    )
-    if not is_distributed:
+    if not dist.is_available():
         return 0, 1
-    backend = 'nccl' if torch.cuda.is_available() else 'gloo'
-    dist.init_process_group(backend=backend)
+
+    # torchrun already sets RANK/WORLD_SIZE — use them directly
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+        dist.init_process_group(backend=backend)
+
+    # SLURM srun — map SLURM vars to what torch.distributed expects
+    elif 'SLURM_PROCID' in os.environ:
+        rank       = int(os.environ['SLURM_PROCID'])
+        world_size = int(os.environ['SLURM_NTASKS'])
+        master_addr = os.environ.get('MASTER_ADDR', 'localhost')
+        master_port = os.environ.get('MASTER_PORT', '29500')
+        os.environ['RANK']       = str(rank)
+        os.environ['WORLD_SIZE'] = str(world_size)
+        os.environ['MASTER_ADDR'] = master_addr
+        os.environ['MASTER_PORT'] = master_port
+        backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+
+    # MPI launcher (mpirun / mpiexec)
+    elif 'OMPI_COMM_WORLD_RANK' in os.environ:
+        dist.init_process_group(backend='mpi')
+
+    else:
+        return 0, 1
+
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     if torch.cuda.is_available():
