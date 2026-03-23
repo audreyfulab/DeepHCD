@@ -139,9 +139,11 @@ RANDOM_SEED = 42
 # Configuration
 # ============================================================================
 
-_SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CONVERTED_DATA_DIR = os.path.join(_SCRIPT_DIR, 'converted_data')
-OUTPUT_PATH = os.path.join(_SCRIPT_DIR, 'deephcd_subset_training')
+_SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONVERTED_DATA_DIR = os.environ.get('DEEPHCD_DATA_DIR',
+                                     os.path.join(_SCRIPT_DIR, 'converted_data'))
+OUTPUT_PATH = os.environ.get('DEEPHCD_OUTPUT_DIR',
+                              os.path.join(_SCRIPT_DIR, 'deephcd_subset_training'))
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 N_PCS = 50
