@@ -426,6 +426,9 @@ with StepTimer("Step 4: Model Creation"):
     if WORLD_SIZE > 1:
         device_ids = [RANK % torch.cuda.device_count()] if torch.cuda.is_available() else None
         model = DDP(model, device_ids=device_ids)
+        # DDP doesn't proxy unknown attributes — expose what Trainer accesses directly
+        model.comm_sizes = model.module.comm_sizes
+        model.method     = model.module.method
         log(f"  Model wrapped in DistributedDataParallel (world_size={WORLD_SIZE})")
 
 n_params = sum(p.numel() for p in model.parameters())
