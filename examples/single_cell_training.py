@@ -61,11 +61,16 @@ def _init_distributed():
         backend = 'nccl' if torch.cuda.is_available() else 'gloo'
         dist.init_process_group(backend=backend)
 
-    # SLURM srun — use MPI backend which uses the cluster's interconnect fabric
-    # (InfiniBand/OmniPath) rather than gloo's arbitrary TCP ports that HPC
-    # firewalls typically block for inter-node all-reduce.
+    # SLURM srun — map SLURM vars to what torch.distributed expects
+    # Gloo is only used for one-way broadcasts (rank 0 → others), not all-reduce,
+    # so the TCP port blocking that broke DDP training is no longer an issue.
     elif 'SLURM_PROCID' in os.environ:
-        dist.init_process_group(backend='mpi')
+        rank       = int(os.environ['SLURM_PROCID'])
+        world_size = int(os.environ['SLURM_NTASKS'])
+        os.environ['RANK']       = str(rank)
+        os.environ['WORLD_SIZE'] = str(world_size)
+        backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
 
     # MPI launcher (mpirun / mpiexec)
     elif 'OMPI_COMM_WORLD_RANK' in os.environ:
