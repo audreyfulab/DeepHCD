@@ -243,6 +243,7 @@ def split_dataset(
 
     # Slice labels for each layer (if provided)
     if labels is not None:
+
         labels_train = [lab[train_indices] for lab in labels]
         labels_val = [lab[val_indices] for lab in labels]
     else:

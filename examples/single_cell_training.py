@@ -42,6 +42,7 @@ except ImportError:
 from deephcd.model.train import Trainer
 from deephcd.utils.utilities import compute_kappa
 from deephcd.utils.utilities import get_input_graph
+from deephcd.utils.train_utils import split_dataset
 
 # ── Distributed setup ────────────────────────────────────────────────────────
 
@@ -125,7 +126,7 @@ if IS_MAIN:
 start_time = time.perf_counter()
 
 # ============================================================================
-# SUBSET CONFIGURATION - SET THESE!
+# SUBSET CONFIGURATION
 # ============================================================================
 
 USE_SUBSET = True
@@ -440,10 +441,16 @@ log("=" * 80)
 
 # Only rank 0 trains — other ranks finished their job during parallel graph building
 if IS_MAIN:
+    log("Splitting data 80/20 into train/validation sets...")
+    train_set, val_set = split_dataset(X, A, labels=true_labels, split=[0.8, 0.2])
+    X_train, A_train, labels_train = train_set
+    log(f"  Train: {X_train.shape[0]} nodes | Validation: {val_set[0].shape[0]} nodes")
+
     trainer = Trainer(
         model=model,
-        X=X,
-        A=A,
+        X=X_train,
+        A=A_train,
+        validation_data=val_set,
         epochs=EPOCHS,
         learning_rate=LEARNING_RATE,
         batch_size=BATCH_SIZE,
@@ -455,7 +462,7 @@ if IS_MAIN:
         early_stopping=EARLY_STOPPING,
         patience=PATIENCE,
         use_batch_learning=True,
-        true_labels=true_labels,
+        true_labels=labels_train,
         output_path=OUTPUT_PATH,
         save_output=True,
         use_logging=True,

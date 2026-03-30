@@ -102,14 +102,13 @@ class GATE(nn.Module):
         self.seqmodel = nn.Sequential(module_dict)
         
         
-    def forward(self, X, A):
+    def forward(self, X, A, ei=None, ea=None):
         weights_list = []
-        ei, ea = pyg_utils.dense_to_sparse(A)
-        #A_SPT = pyg_utils.to_torch_csr_tensor(Asparse[0], Asparse[1])
-        #ei, ea = pyg_utils.to_edge_index(A_SPT)
+        if ei is None:
+            ei, ea = pyg_utils.dense_to_sparse(A)
         H, E, attr, weights_list = self.seqmodel((X, ei, ea, weights_list))
-        
-        return (H, A, weights_list) 
+
+        return (H, A, weights_list)
     
 
     
@@ -184,10 +183,13 @@ class CommunityDetectionLayers(nn.Module):
         self.model = nn.Sequential(module_dict)
         
         
-    def forward(self, Z, A):
-        H_layers = self.model([Z, A, [], [], [], []])
-        
-        return H_layers
+    def forward(self, Z, A, ei=None, ea=None):
+        inputs = [Z, A, [], [], [], []]
+        if ei is not None:
+            inputs.append(ei)
+        H_layers = self.model(inputs)
+
+        return H_layers[:6]
         
 
 
@@ -329,35 +331,37 @@ class HCD(nn.Module):
         self.dpd_norm = nn.Identity()
         
         
-    def forward(self, X, A):
+    def forward(self, X, A, ei=None, ea=None):
         device = X.device
 
-        self.to(device) 
+        self.to(device)
 
         if hasattr(self.input_norm, 'weight') and self.input_norm.weight.device != X.device:
            self.input_norm = self.input_norm.to(X.device)
         #normalize input
 
         H = self.input_norm(X)
-        
+
+        # Pre-compute sparse edge_index once for the full batch A so encoder,
+        # decoder, and top community module all reuse it without re-scanning A.
+        if ei is None:
+            ei, ea = pyg_utils.dense_to_sparse(A)
+
         #get embedding representation
         _t0 = time.perf_counter()
-        Z, A, encoder_attention_weights = self.encoder(H,A)
+        Z, A, encoder_attention_weights = self.encoder(H, A, ei=ei, ea=ea)
         forward_timing['gate_encoder'] += time.perf_counter() - _t0
 
         # Normalize embeddings before dot product
         Z_norm = F.normalize(Z, p=2, dim=1)
-        #find other normalize functions
         sim = torch.mm(Z_norm, Z_norm.T)
         A_hat = self.dpd_act(sim)
         sim = torch.clamp(sim, -10, 10)
 
-
         A_logits = self.dpd_norm(torch.mm(Z, Z.transpose(0,1)))
-        #A_hat = self.dpd_act(self.dpd_norm(torch.mm(Z, Z.transpose(0,1))))
         #get reconstructed adjacency
         _t0 = time.perf_counter()
-        X_hat, A, decoder_attention_weights = self.decoder(Z, A)
+        X_hat, A, decoder_attention_weights = self.decoder(Z, A, ei=ei, ea=ea)
         forward_timing['gate_decoder'] += time.perf_counter() - _t0
 
         _t_clust = time.perf_counter()
@@ -368,20 +372,20 @@ class HCD(nn.Module):
             if self.use_output_layers:
                 #Output learning layers:
                 W = self.fully_connected_layers(Z)
-            
+
                 #fit hierarchy
-                X_top, A_top, X_all, A_all, P_all, S_all = self.commModule(W, A)
+                X_top, A_top, X_all, A_all, P_all, S_all = self.commModule(W, A, ei=ei, ea=ea)
             else:
-                X_top, A_top, X_all, A_all, P_all, S_all = self.commModule(Z, A)
-                
-        
+                X_top, A_top, X_all, A_all, P_all, S_all = self.commModule(Z, A, ei=ei, ea=ea)
+
+
         #top down method
         if self.method == 'top_down':
                 #fit hierarchy
-                
+
                 #Get initial set of labels S - a list with one element (a tensor of class labels)
                 if self.use_kmeans_top:
-                    if self.use_output_layers: 
+                    if self.use_output_layers:
                         W = self.fully_connected_layers(Z)
                         result = self.TopCommModule(W.unsqueeze(0))
                     else:
@@ -392,9 +396,9 @@ class HCD(nn.Module):
                     if self.use_output_layers:
                         #Output learning layers:
                         W = self.fully_connected_layers(Z)
-                        X_top, A_top, X_all, A_all, P_all, S = self.TopCommModule(W, A)
+                        X_top, A_top, X_all, A_all, P_all, S = self.TopCommModule(W, A, ei=ei, ea=ea)
                     else:
-                        X_top, A_top, X_all, A_all, P_all, S = self.TopCommModule(Z, A)
+                        X_top, A_top, X_all, A_all, P_all, S = self.TopCommModule(Z, A, ei=ei, ea=ea)
                         
                     P = P_all[0]
                  

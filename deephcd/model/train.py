@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 import time
-import torch.optim as optimizers 
+import torch.optim as optimizers
+from torch_geometric.utils import dense_to_sparse
 from deephcd.utils.utilities import logging_config, trace_comms
 from deephcd.utils.train_utils import get_batch_data, get_efficient_batches, evaluate, memory_efficient_context, load_batch_output, modularity, wcss
 import os
@@ -673,16 +674,6 @@ class Trainer():
         
         comm_layers = len(model.comm_sizes)
         
-        # Auto-split for early stopping
-        if self.early_stopping and self.validation_data is None:
-            from deephcd.utils.train_utils import split_dataset
-            self.logprint("No validation data provided. Auto-splitting input data 80/20 for early stopping.")
-            train_set, val_set = split_dataset(self.X, self.A, labels=self.true_labels, split=[0.8, 0.2])
-            self.X, self.A = train_set[0], train_set[1]
-            if train_set[2] is not None:
-                self.true_labels = train_set[2]
-            self.validation_data = val_set
-
         # Early stopping
         if self.early_stopping:
             early_stop = EarlyStopping(patience=self.patience,
@@ -733,11 +724,15 @@ class Trainer():
                 with memory_efficient_context():
                     # Get batch data on device
                     X_batch, A_batch = get_batch_data(self.X, self.A, batch_indices, device)
-                    
+
+                    # Pre-compute sparse edge_index once — avoids 3-5x redundant
+                    # dense_to_sparse calls inside encoder, decoder, and community layers
+                    ei_batch, ea_batch = dense_to_sparse(A_batch)
+
                     optimizer.zero_grad()
-                    
+
                     # Forward pass
-                    forward_output = model.forward(X_batch, A_batch)
+                    forward_output = model.forward(X_batch, A_batch, ei=ei_batch, ea=ea_batch)
                     X_hat, A_hat, A_logit, X_all, A_all, P_all, S_all, AW = forward_output
 
                     P_all = [
@@ -777,7 +772,7 @@ class Trainer():
                             train_epoch_losses['mod'][i] += m
                     
                     # Clear batch data from GPU
-                    del X_batch, A_batch, forward_output
+                    del X_batch, A_batch, ei_batch, ea_batch, forward_output
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
             
@@ -813,7 +808,8 @@ class Trainer():
                         val_loss = A_loss_val + self.gamma * X_loss_val
 
 
-            val_loss_history.append({'Total Loss': val_loss})
+            if self.validation_data:
+                val_loss_history.append({'Total Loss': val_loss})
             
             # Performance evaluation (periodic)
             if epoch % self.update_interval == 0:
@@ -836,8 +832,9 @@ class Trainer():
                               Training Loss: {total_loss}
                               Validation Loss: {val_loss}
                               """)
-
-                loss_value = val_loss if self.validation_data else total_loss
+                n_batches = len(self.batch_indices_list)
+                avg_train_loss = total_loss / n_batches if n_batches > 0 else total_loss
+                loss_value = val_loss if self.validation_data else avg_train_loss
                 loss_type = 'validation' if self.validation_data else 'total'
                 early_stop(loss_value, model, loss_type)
                 if early_stop.early_stop:

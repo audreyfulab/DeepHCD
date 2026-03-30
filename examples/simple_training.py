@@ -51,7 +51,15 @@ print(f"   Estimated communities: {comm_sizes}")
 
 # 3. Create model
 
-train_set, test_set = split_dataset(X,A,labels)
+#making labels a list of tensors
+labels_list = []
+if len(sorted_top) > 0:
+    labels_list.append(torch.LongTensor(sorted_top))
+if len(sorted_mid) > 0:
+    labels_list.append(torch.LongTensor(sorted_mid))
+labels_list = labels_list if labels_list else None
+
+train_set, val_set = split_dataset(X,A,labels_list)
 
 print("\n3. Creating HCD model...")
 model = HCD(
@@ -62,7 +70,7 @@ model = HCD(
     comm_sizes=comm_sizes,          # Community sizes from step 2
     ae_operator='GATv2Conv',        # Graph attention operator
     dropout=0.2,
-    normalize_input=True
+    normalize_input=True,
 ).to(DEVICE)
 
 print(f"   Model created with {sum(p.numel() for p in model.parameters()):,} parameters")
@@ -71,15 +79,15 @@ print(f"   Model created with {sum(p.numel() for p in model.parameters()):,} par
 print("\n4. Training model...")
 trainer = Trainer(
     model=model,
-    X=train_set,
-    A=A,
-    test_data=test_set,
+    X=train_set[0],
+    A=train_set[1],
+    validation_data=val_set,
     epochs=30,                      # Number of training epochs
     learning_rate=1e-3,             # Learning rate
     batch_size=32,                  # Batch size
     early_stopping=True,            # Enable early stopping
     patience=5,                     # Stop if no improvement for 5 epochs
-    true_labels=[sorted_top, sorted_mid],  # For evaluation
+    true_labels= train_set[2],  # For evaluation
     output_path=OUTPUT_PATH,           # Output directory
     verbose=True
 )
