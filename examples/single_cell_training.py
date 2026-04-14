@@ -70,6 +70,13 @@ def _init_distributed():
         world_size = int(os.environ['SLURM_NTASKS'])
         os.environ['RANK']       = str(rank)
         os.environ['WORLD_SIZE'] = str(world_size)
+
+        # Derive a unique port from the SLURM job ID so concurrent jobs on the
+        # same node don't collide on the default port 29500.
+        job_id = int(os.environ.get('SLURM_JOB_ID', 0))
+        os.environ['MASTER_PORT'] = str(29500 + job_id % 10000)
+        os.environ['MASTER_ADDR'] = os.environ.get('SLURMD_NODENAME', 'localhost')
+
         backend = 'nccl' if torch.cuda.is_available() else 'gloo'
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
 
@@ -396,7 +403,7 @@ elif nodes < 5000:
     LEARNING_RATE, BATCH_SIZE, EPOCHS = 1e-4, 128, 150
     log(f"Medium dataset (1-5K): LR={LEARNING_RATE}, Batch={BATCH_SIZE}, Epochs={EPOCHS}")
 elif nodes < 10000:
-    LEARNING_RATE, BATCH_SIZE, EPOCHS = 1e-5, 256, 100
+    LEARNING_RATE, BATCH_SIZE, EPOCHS = 1e-5, 64, 100
     log(f"Large dataset (5-10K): LR={LEARNING_RATE}, Batch={BATCH_SIZE}, Epochs={EPOCHS}")
 else:
     LEARNING_RATE, BATCH_SIZE, EPOCHS = 1e-5, 512, 100

@@ -5,6 +5,7 @@ import time
 import torch.optim as optimizers
 from torch_geometric.utils import dense_to_sparse
 from deephcd.utils.utilities import logging_config, trace_comms
+from deephcd.model.model import forward_timing
 from deephcd.utils.train_utils import get_batch_data, get_efficient_batches, evaluate, memory_efficient_context, load_batch_output, modularity, wcss
 import os
 from typing import Optional, Union, List, Literal, Dict, Any, Tuple
@@ -330,12 +331,10 @@ class OptimizedModularityLoss(nn.Module):
 
         for index, (A, P) in enumerate(zip(all_A, all_P)):
             resolution = resolutions[index] if (resolutions and index < len(resolutions)) else 1.0
-            
-            with memory_efficient_context():
-                mod = modularity(A, P, resolution)
-                loss += mod
-                loss_list.append(float(mod.detach().cpu().numpy()))
-                
+            mod = modularity(A, P, resolution)
+            loss += mod
+            loss_list.append(float(mod.detach().cpu().numpy()))
+
         return loss, loss_list
 
 
@@ -356,20 +355,19 @@ class OptimizedClusterLoss(nn.Module):
             
         for idx, P in enumerate(Probabilities):
             Attr = Attributes[idx] if isinstance(Attributes, list) else Attributes
-            
+
             if method == 'bottom_up':
                 ptensor_list.append(P)
             else:
                 ptensor_list = P
-                
-            with memory_efficient_context():
-                within_ss, centroids = wcss(X=Attr, Plist=ptensor_list, method=method)
-                
-                weight = Lamb[idx] if isinstance(Lamb, list) else Lamb
-                weighted_loss = weight * within_ss
-                
-                loss_list.append(float(weighted_loss.detach().cpu().numpy()))
-                loss += weighted_loss
+
+            within_ss, centroids = wcss(X=Attr, Plist=ptensor_list, method=method)
+
+            weight = Lamb[idx] if isinstance(Lamb, list) else Lamb
+            weighted_loss = weight * within_ss
+
+            loss_list.append(float(weighted_loss.detach().cpu().numpy()))
+            loss += weighted_loss
 
         return loss, loss_list
 
@@ -719,10 +717,11 @@ class Trainer():
             
             # Batch processing with memory management
             for batch_idx, batch_indices in enumerate(self.batch_indices_list):
-                
-                
+
+
                 with memory_efficient_context():
                     # Get batch data on device
+                    _t0 = time.perf_counter()
                     X_batch, A_batch = get_batch_data(self.X, self.A, batch_indices, device)
 
                     # Pre-compute sparse edge_index once — avoids 3-5x redundant
@@ -730,6 +729,7 @@ class Trainer():
                     ei_batch, ea_batch = dense_to_sparse(A_batch)
 
                     optimizer.zero_grad()
+                    forward_timing['batch_prep'] += time.perf_counter() - _t0
 
                     # Forward pass
                     forward_output = model.forward(X_batch, A_batch, ei=ei_batch, ea=ea_batch)
@@ -741,24 +741,34 @@ class Trainer():
                        for p in P_all]
                     
                     # Compute losses efficiently
+                    _t0 = time.perf_counter()
                     mod_clust_output = self.get_mod_clust_losses(
-                        model, X_batch, A_batch, forward_output, self._lambda, 
+                        model, X_batch, A_batch, forward_output, self._lambda,
                         self.graph_resolutions, modularity_loss_fn, clustering_loss_fn
                     )
                     Mod_loss, Modloss_values, Clust_loss, Clustloss_values = mod_clust_output
-                    
-                    
+
                     # Reconstruction losses
                     X_loss = X_recon_loss(X_hat, X_batch)
                     A_loss = A_recon_loss(A_logit, A_batch)  # Use logits for numerical stability
-                    
+
                     # Total loss
                     batch_loss = A_loss + self.gamma * X_loss + Clust_loss - self.delta * Mod_loss
+                    forward_timing['loss_compute'] += time.perf_counter() - _t0
                     self.logprint(f'A_loss: {A_loss} X_loss: {X_loss} Clust_loss: {Clust_loss} Mod_loss: {Mod_loss}')
+
                     # Backward pass
+                    _t0 = time.perf_counter()
                     batch_loss.backward()
+                    forward_timing['backward'] += time.perf_counter() - _t0
+
+                    _t0 = time.perf_counter()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    forward_timing['grad_clip'] += time.perf_counter() - _t0
+
+                    _t0 = time.perf_counter()
                     optimizer.step()
+                    forward_timing['optimizer_step'] += time.perf_counter() - _t0
                     
                     # Update epoch losses
                     total_loss += batch_loss.item()
@@ -772,9 +782,11 @@ class Trainer():
                             train_epoch_losses['mod'][i] += m
                     
                     # Clear batch data from GPU
+                    _t0 = time.perf_counter()
                     del X_batch, A_batch, ei_batch, ea_batch, forward_output
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                    forward_timing['gpu_cleanup'] += time.perf_counter() - _t0
             
             # Store training history
             train_loss_history.append({
@@ -791,6 +803,7 @@ class Trainer():
             X_loss_val = 0.0
             if self.validation_data:
                 eval_X, eval_A, eval_labels = self.validation_data
+                _t0 = time.perf_counter()
                 with memory_efficient_context():
                     val_perf, val_output, S_replab_val = evaluate(
                         model, eval_X, eval_A, self.k, eval_labels, device=device
@@ -806,6 +819,7 @@ class Trainer():
                         X_loss_val = X_recon_loss(X_hat_dev, eval_X_dev).item()
                         A_loss_val = A_recon_loss(A_hat_dev, eval_A_dev).item()
                         val_loss = A_loss_val + self.gamma * X_loss_val
+                forward_timing['validation'] += time.perf_counter() - _t0
 
 
             if self.validation_data:
@@ -813,16 +827,18 @@ class Trainer():
             
             # Performance evaluation (periodic)
             if epoch % self.update_interval == 0:
+                _t0 = time.perf_counter()
                 with memory_efficient_context():
                     train_perf, eval_output, S_eval = evaluate(
                         model, self.X, self.A, self.k, self.true_labels, device=device
                     )
                     perf_hist.append(train_perf)
                     pred_list.append(S_eval)
-                    
+
                     if self.true_labels:
                         self.logprint('\nMODEL PERFORMANCE')
                         self.print_performance(perf_hist, comm_layers, self.k)
+                forward_timing['perf_eval'] += time.perf_counter() - _t0
             
             # Early stopping check
             if self.early_stopping:
