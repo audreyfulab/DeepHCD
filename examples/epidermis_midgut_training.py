@@ -14,17 +14,21 @@ Launch (single process):
 """
 
 import os
+import sys
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 import pandas as pd
-from scipy.io import mmread
 from scipy.sparse import issparse
 from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import StandardScaler
 import time
 import tracemalloc
+
+# h5ad loader — lives two levels up from this script (DeepHCD_copy/)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from load_h5ad import load_h5ad_data, filter_cell_types
 
 from deephcd.model.model import HCD
 try:
@@ -51,9 +55,15 @@ def _init_distributed():
         world_size = int(os.environ['SLURM_NTASKS'])
         os.environ['RANK']       = str(rank)
         os.environ['WORLD_SIZE'] = str(world_size)
-        job_id = int(os.environ.get('SLURM_JOB_ID', 0))
-        os.environ['MASTER_PORT'] = str(29500 + job_id % 10000)
-        os.environ['MASTER_ADDR'] = os.environ.get('SLURMD_NODENAME', 'localhost')
+        # Only set MASTER_PORT/ADDR if not already provided by the SLURM script.
+        # SLURMD_NODENAME is the *current* node and differs per rank — using it
+        # as MASTER_ADDR causes every rank to think it is the master, breaking
+        # the Gloo TCP rendezvous with a bad_alloc crash.
+        if 'MASTER_PORT' not in os.environ:
+            job_id = int(os.environ.get('SLURM_JOB_ID', 0))
+            os.environ['MASTER_PORT'] = str(29500 + job_id % 10000)
+        if 'MASTER_ADDR' not in os.environ:
+            os.environ['MASTER_ADDR'] = 'localhost'
         backend = 'nccl' if torch.cuda.is_available() else 'gloo'
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     elif 'OMPI_COMM_WORLD_RANK' in os.environ:
@@ -68,6 +78,21 @@ def _init_distributed():
 
 RANK, WORLD_SIZE = _init_distributed()
 IS_MAIN = RANK == 0
+
+# When rank 0 crashes with an uncaught exception before the first broadcast,
+# other ranks hang waiting for it. This hook fires on rank 0 before Python
+# exits, broadcasts a failure flag so all ranks can shut down cleanly.
+_ok = [True]
+if WORLD_SIZE > 1:
+    _orig_excepthook = sys.excepthook
+    def _excepthook(exc_type, exc_val, exc_tb):
+        if IS_MAIN:
+            try:
+                dist.broadcast_object_list([False], src=0)
+            except Exception:
+                pass
+        _orig_excepthook(exc_type, exc_val, exc_tb)
+    sys.excepthook = _excepthook
 
 def log(*args, **kwargs):
     if IS_MAIN:
@@ -108,18 +133,18 @@ TARGET_CELL_TYPES = ['epidermis', 'midgut']
 
 # Subsetting: use stratified sampling so both cell types are represented
 USE_SUBSET    = True
-SUBSET_SIZE   = 2000    # total cells after filter; set to None to use all
+SUBSET_SIZE   = 500    # total cells after filter; set to None to use all
 SUBSET_METHOD = 'stratified'
 RANDOM_SEED   = 42
 
 _SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CONVERTED_DATA_DIR = os.environ.get(
+H5AD_PATH = os.environ.get(
     'DEEPHCD_DATA_DIR',
-    os.path.join(_SCRIPT_DIR, 'converted_data_joined')   # produced by join_cell_types.py
+    os.path.join(_SCRIPT_DIR, 'converted_data_h5ad', 'data.h5ad')
 )
 OUTPUT_PATH = os.environ.get(
     'DEEPHCD_OUTPUT_DIR',
-    os.path.join(_SCRIPT_DIR, 'deephcd_epidermis_midgut_100PC')
+    os.path.join(_SCRIPT_DIR, 'epidermis_midgut_100PC_500Subset_npcorr')
 )
 DEVICE  = 'cuda' if torch.cuda.is_available() else 'cpu'
 N_PCS   = 100
@@ -133,69 +158,20 @@ log("DeepHCD  —  Epidermis vs Midgut")
 log("=" * 80)
 log(f"\nTarget cell types : {TARGET_CELL_TYPES}")
 log(f"Device            : {DEVICE}")
-log(f"Data directory    : {CONVERTED_DATA_DIR}")
+log(f"H5AD file         : {H5AD_PATH}")
 log(f"Output directory  : {OUTPUT_PATH}")
 
 # ============================================================================
-# STEP 1: Load data
+# STEP 1: Load data from h5ad
 # ============================================================================
 
 log("\n" + "=" * 80)
 log("STEP 1: Loading Data")
 log("=" * 80)
 
-def load_converted_data(data_dir):
-    data = {}
-
-    print("Loading expression matrix...", flush=True)
-    expression = mmread(os.path.join(data_dir, "expression_matrix.mtx")).tocsr()
-    print(f"  Expression: {expression.shape}", flush=True)
-
-    genes = pd.read_csv(os.path.join(data_dir, "genes.csv"))['gene'].tolist()
-    cells = pd.read_csv(os.path.join(data_dir, "cells.csv"))['cell'].tolist()
-    print(f"  Genes: {len(genes)}, Cells: {len(cells)}", flush=True)
-
-    metadata = pd.read_csv(os.path.join(data_dir, "metadata.csv"), index_col=0)
-    print(f"  Metadata: {metadata.shape}", flush=True)
-
-    adj_path = os.path.join(data_dir, "adjacency_matrix.mtx")
-    if os.path.exists(adj_path):
-        print("Loading adjacency matrix (sparse)...", flush=True)
-        adjacency = mmread(adj_path).tocsr()
-        print(f"  Adjacency: {adjacency.shape}", flush=True)
-    else:
-        adjacency = None
-        print("  No adjacency matrix found", flush=True)
-
-    cluster_path = os.path.join(data_dir, "cluster_labels.csv")
-    labels = None
-    if os.path.exists(cluster_path):
-        clusters = pd.read_csv(cluster_path)
-        labels = clusters['cluster'].values
-        print(f"  Cluster labels: {len(np.unique(labels))} clusters", flush=True)
-
-    # Cell-type labels added by join_cell_types.py
-    ct_path = os.path.join(data_dir, "cell_type_labels.csv")
-    ct_labels = None
-    if os.path.exists(ct_path):
-        ct_df = pd.read_csv(ct_path)
-        ct_labels = ct_df['cell_type'].values
-        print(f"  Cell-type labels: {len(np.unique(ct_labels))} types", flush=True)
-    else:
-        print("  WARNING: cell_type_labels.csv not found — run join_cell_types.py first", flush=True)
-
-    data['expression'] = expression
-    data['genes']      = genes
-    data['cells']      = cells
-    data['metadata']   = metadata
-    data['adjacency']  = adjacency
-    data['labels']     = labels
-    data['ct_labels']  = ct_labels
-    return data
-
 if IS_MAIN:
     with StepTimer("Step 1: Load Data"):
-        data = load_converted_data(CONVERTED_DATA_DIR)
+        data = load_h5ad_data(H5AD_PATH)
 
 # ============================================================================
 # STEP 1.5: Filter to target cell types
@@ -206,43 +182,15 @@ if IS_MAIN:
     log("=" * 80)
 
     with StepTimer("Step 1.5: Filter"):
-        meta = data['metadata']
-
-        if 'manual_annot' not in meta.columns:
-            raise RuntimeError(
-                "'manual_annot' column missing from metadata.csv.\n"
-                "Run join_cell_types.py first to add cell-type annotations."
-            )
-
-        # Build boolean mask aligned to the cell order
-        mask = meta['manual_annot'].isin(TARGET_CELL_TYPES).values
-        indices = np.where(mask)[0]
-
         total_before = len(data['cells'])
         log(f"Total cells before filter : {total_before:,}")
-        log(f"Cells matching {TARGET_CELL_TYPES} : {len(indices):,}")
 
-        if len(indices) == 0:
-            raise RuntimeError(
-                f"No cells found for {TARGET_CELL_TYPES}. "
-                "Check TARGET_CELL_TYPES matches manual_annot values exactly."
-            )
+        data = filter_cell_types(data, TARGET_CELL_TYPES)
 
-        # Report per-type counts
-        for ct in TARGET_CELL_TYPES:
-            n = (meta['manual_annot'].values == ct).sum()
-            log(f"  {ct}: {n:,} cells")
-
-        # Apply filter
-        expression = data['expression']
-        if expression.shape[0] < expression.shape[1]:
-            expression = expression.T   # ensure cells × genes
-
-        expression = expression[indices, :]
-        cells_filtered = [data['cells'][i] for i in indices]
-        meta_filtered  = meta.iloc[indices].copy()
-        adj_filtered   = (data['adjacency'][indices][:, indices]
-                          if data['adjacency'] is not None else None)
+        expression     = data['expression']
+        cells_filtered = data['cells']
+        meta_filtered  = data['metadata']
+        adj_filtered   = data['adjacency']
 
         # Encode target cell types as binary true labels (alphabetical order)
         sorted_types = sorted(TARGET_CELL_TYPES)
@@ -254,10 +202,9 @@ if IS_MAIN:
         for name, idx in ct_map.items():
             log(f"  {idx} = {name}  ({(ct_labels_filtered == idx).sum():,} cells)")
 
-        # Cluster labels (Seurat) for the filtered subset — used as fine labels
-        seurat_labels_filtered = None
-        if data['labels'] is not None:
-            seurat_labels_filtered = data['labels'][indices]
+        # Seurat cluster labels for the filtered subset — used as fine labels
+        seurat_labels_filtered = data['labels']
+        if seurat_labels_filtered is not None:
             log(f"\nSeurat clusters in subset: {len(np.unique(seurat_labels_filtered))}")
 
     # ── Optional stratified subsetting ──────────────────────────────────────
@@ -335,6 +282,15 @@ else:
     X_np = None
     _broadcast_meta = [None, None, None, None]
     total_cells = 0
+
+# Broadcast success/failure so non-main ranks can exit cleanly if rank 0 failed
+if WORLD_SIZE > 1:
+    dist.broadcast_object_list(_ok, src=0)
+if not _ok[0]:
+    log("Rank 0 encountered an error — all ranks exiting.")
+    if WORLD_SIZE > 1:
+        dist.destroy_process_group()
+    sys.exit(1)
 
 # Broadcast to other ranks if distributed
 if WORLD_SIZE > 1:
@@ -427,6 +383,7 @@ else:
 
 EARLY_STOPPING = True
 PATIENCE = 10
+PLOT_HEATMAPS = True
 
 with StepTimer("Step 4: Model Creation"):
     model = HCD(
@@ -571,78 +528,81 @@ if IS_MAIN:
             log(f"Predictions saved: {pred_path}")
 
     # ── Heatmaps ──────────────────────────────────────────────────────────────
-    with StepTimer("Step 7: Heatmaps"):
-        try:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-            import seaborn as sns
+    if not PLOT_HEATMAPS:
+        log("Heatmap generation skipped (PLOT_HEATMAPS=False)")
+    if PLOT_HEATMAPS:
+        with StepTimer("Step 7: Heatmaps"):
+            try:
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as plt
+                import seaborn as sns
 
-            top_preds = output.predicted_train.get('top')
-            mid_preds = output.predicted_train.get('middle')
-            top_arr = top_preds.cpu().numpy() if top_preds is not None else None
-            mid_arr = mid_preds.cpu().numpy() if mid_preds is not None else None
-            _n = (len(top_arr) if top_arr is not None else
-                  len(mid_arr) if mid_arr is not None else len(cells_filtered))
-            pred_df = pd.DataFrame({
-                'cell':           cells_filtered[:_n],
-                'true_cell_type': [sorted_types[v] for v in ct_labels_filtered[:_n]],
-                'top_cluster':    top_arr if top_arr is not None else [None] * _n,
-                'middle_cluster': mid_arr if mid_arr is not None else [None] * _n,
-            })
+                top_preds = output.predicted_train.get('top')
+                mid_preds = output.predicted_train.get('middle')
+                top_arr = top_preds.cpu().numpy() if top_preds is not None else None
+                mid_arr = mid_preds.cpu().numpy() if mid_preds is not None else None
+                _n = (len(top_arr) if top_arr is not None else
+                      len(mid_arr) if mid_arr is not None else len(cells_filtered))
+                pred_df = pd.DataFrame({
+                    'cell':           cells_filtered[:_n],
+                    'true_cell_type': [sorted_types[v] for v in ct_labels_filtered[:_n]],
+                    'top_cluster':    top_arr if top_arr is not None else [None] * _n,
+                    'middle_cluster': mid_arr if mid_arr is not None else [None] * _n,
+                })
 
-            X_np_plot = X.numpy()[:_n]
+                X_np_plot = X.numpy()[:_n]
 
-            # Sort by true cell type then predicted top cluster
-            sorted_df  = pred_df.dropna(subset=['top_cluster']).sort_values(
-                ['true_cell_type', 'top_cluster'])
-            sorted_idx = sorted_df.index.to_numpy()
-            corr_matrix = np.corrcoef(X_np_plot[sorted_idx])
+                # Sort by true cell type then predicted top cluster
+                sorted_df  = pred_df.dropna(subset=['top_cluster']).sort_values(
+                    ['true_cell_type', 'top_cluster'])
+                sorted_idx = sorted_df.index.to_numpy()
+                corr_matrix = np.corrcoef(X_np_plot[sorted_idx])
 
-            fig, ax = plt.subplots(figsize=(10, 9))
-            sns.heatmap(corr_matrix, ax=ax, cmap='coolwarm', center=0,
-                        vmin=-1, vmax=1, xticklabels=False, yticklabels=False,
-                        cbar_kws={'label': 'Pearson Correlation'})
-            # Draw dividers at cell-type boundaries
-            ct_vals = sorted_df['true_cell_type'].values
-            for b in np.where(np.diff(ct_vals != ct_vals[0]))[0] + 1:
-                ax.axhline(b, color='black', linewidth=1.5, linestyle='--')
-                ax.axvline(b, color='black', linewidth=1.5, linestyle='--')
-            ax.set_title('Cell-Cell Correlation (sorted by cell type then cluster)')
-            ax.set_xlabel('Cells')
-            ax.set_ylabel('Cells')
-            plt.tight_layout()
-            heatmap1_path = os.path.join(OUTPUT_PATH, 'heatmap_cell_correlation.png')
-            plt.savefig(heatmap1_path, dpi=150)
-            plt.close()
-            log(f"Cell-cell correlation heatmap saved: {heatmap1_path}")
-
-            for level, col in [('top', 'top_cluster'), ('middle', 'middle_cluster')]:
-                co = pred_df.dropna(subset=[col])
-                if len(co) == 0:
-                    continue
-                cluster_ids = sorted(co[col].astype(int).unique())
-                cluster_means = np.stack([
-                    X_np_plot[co[co[col].astype(int) == c].index].mean(axis=0)
-                    for c in cluster_ids
-                ])
-                inter_corr = np.corrcoef(cluster_means)
-                fig, ax = plt.subplots(figsize=(max(6, len(cluster_ids)),
-                                                max(5, len(cluster_ids) - 1)))
-                sns.heatmap(inter_corr, ax=ax, cmap='coolwarm', center=0,
-                            vmin=-1, vmax=1, annot=True, fmt='.2f',
-                            xticklabels=[f'C{c}' for c in cluster_ids],
-                            yticklabels=[f'C{c}' for c in cluster_ids],
+                fig, ax = plt.subplots(figsize=(10, 9))
+                sns.heatmap(corr_matrix, ax=ax, cmap='coolwarm', center=0,
+                            vmin=-1, vmax=1, xticklabels=False, yticklabels=False,
                             cbar_kws={'label': 'Pearson Correlation'})
-                ax.set_title(f'Inter-Cluster Correlation ({level.capitalize()} level)')
+                # Draw dividers at cell-type boundaries
+                ct_vals = sorted_df['true_cell_type'].values
+                for b in np.where(np.diff(ct_vals != ct_vals[0]))[0] + 1:
+                    ax.axhline(b, color='black', linewidth=1.5, linestyle='--')
+                    ax.axvline(b, color='black', linewidth=1.5, linestyle='--')
+                ax.set_title('Cell-Cell Correlation (sorted by cell type then cluster)')
+                ax.set_xlabel('Cells')
+                ax.set_ylabel('Cells')
                 plt.tight_layout()
-                hm_path = os.path.join(OUTPUT_PATH, f'heatmap_cluster_corr_{level}.png')
-                plt.savefig(hm_path, dpi=150)
+                heatmap1_path = os.path.join(OUTPUT_PATH, 'heatmap_cell_correlation.png')
+                plt.savefig(heatmap1_path, dpi=150)
                 plt.close()
-                log(f"Cluster correlation heatmap saved: {hm_path}")
+                log(f"Cell-cell correlation heatmap saved: {heatmap1_path}")
 
-        except Exception as e:
-            log(f"Heatmap generation failed: {e}")
+                for level, col in [('top', 'top_cluster'), ('middle', 'middle_cluster')]:
+                    co = pred_df.dropna(subset=[col])
+                    if len(co) == 0:
+                        continue
+                    cluster_ids = sorted(co[col].astype(int).unique())
+                    cluster_means = np.stack([
+                        X_np_plot[co[co[col].astype(int) == c].index].mean(axis=0)
+                        for c in cluster_ids
+                    ])
+                    inter_corr = np.corrcoef(cluster_means)
+                    fig, ax = plt.subplots(figsize=(max(6, len(cluster_ids)),
+                                                    max(5, len(cluster_ids) - 1)))
+                    sns.heatmap(inter_corr, ax=ax, cmap='coolwarm', center=0,
+                                vmin=-1, vmax=1, annot=True, fmt='.2f',
+                                xticklabels=[f'C{c}' for c in cluster_ids],
+                                yticklabels=[f'C{c}' for c in cluster_ids],
+                                cbar_kws={'label': 'Pearson Correlation'})
+                    ax.set_title(f'Inter-Cluster Correlation ({level.capitalize()} level)')
+                    plt.tight_layout()
+                    hm_path = os.path.join(OUTPUT_PATH, f'heatmap_cluster_corr_{level}.png')
+                    plt.savefig(hm_path, dpi=150)
+                    plt.close()
+                    log(f"Cluster correlation heatmap saved: {hm_path}")
+
+            except Exception as e:
+                log(f"Heatmap generation failed: {e}")
 
     # ── Timing summary ─────────────────────────────────────────────────────────
     tracemalloc.stop()

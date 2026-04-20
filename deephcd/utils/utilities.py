@@ -564,7 +564,12 @@ def get_input_graph(X = None, method = ['KNN','Presicion','Correlation', 'DAG-GN
     '''
     
     
-    
+    def fast_corr(X):
+        """X: genes × cells matrix"""
+        X = X - X.mean(axis=1, keepdims=True)
+        X /= np.linalg.norm(X, axis=1, keepdims=True)
+        return X @ X.T
+
     if method == 'KNN':
         if metric == '1-R^2':
             A = kneighbors_graph(X, n_neighbors = K, metric = corr_dist)
@@ -581,7 +586,7 @@ def get_input_graph(X = None, method = ['KNN','Presicion','Correlation', 'DAG-GN
         
     if method == 'Correlation':
         #get the absolute correlations
-        cormat = np.absolute(np.corrcoef(X))
+        cormat = np.absolute(fast_corr(X))
         A_adj = np.copy(cormat)
         A_adj[A_adj>r_cutoff] = 1
         A_adj[A_adj<=r_cutoff] = 0

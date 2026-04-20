@@ -71,11 +71,15 @@ def _init_distributed():
         os.environ['RANK']       = str(rank)
         os.environ['WORLD_SIZE'] = str(world_size)
 
-        # Derive a unique port from the SLURM job ID so concurrent jobs on the
-        # same node don't collide on the default port 29500.
-        job_id = int(os.environ.get('SLURM_JOB_ID', 0))
-        os.environ['MASTER_PORT'] = str(29500 + job_id % 10000)
-        os.environ['MASTER_ADDR'] = os.environ.get('SLURMD_NODENAME', 'localhost')
+        # Only set MASTER_PORT/ADDR if not already provided by the SLURM script.
+        # SLURMD_NODENAME is the *current* node and differs per rank — using it
+        # as MASTER_ADDR causes every rank to think it is the master, breaking
+        # the Gloo TCP rendezvous with a bad_alloc crash.
+        if 'MASTER_PORT' not in os.environ:
+            job_id = int(os.environ.get('SLURM_JOB_ID', 0))
+            os.environ['MASTER_PORT'] = str(29500 + job_id % 10000)
+        if 'MASTER_ADDR' not in os.environ:
+            os.environ['MASTER_ADDR'] = 'localhost'
 
         backend = 'nccl' if torch.cuda.is_available() else 'gloo'
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)

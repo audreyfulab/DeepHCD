@@ -328,7 +328,7 @@ class OptimizedModularityLoss(nn.Module):
     def forward(self, all_A, all_P, resolutions=None):
         loss = 0.0
         loss_list = []
-
+    
         for index, (A, P) in enumerate(zip(all_A, all_P)):
             resolution = resolutions[index] if (resolutions and index < len(resolutions)) else 1.0
             mod = modularity(A, P, resolution)
