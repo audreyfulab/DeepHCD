@@ -372,6 +372,18 @@ class OptimizedClusterLoss(nn.Module):
         return loss, loss_list
 
 
+# ======================================================================================
+# Nonzero-masked MSE loss
+# ======================================================================================
+def masked_mse_loss(X_hat: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+    """MSE computed only over entries where X is nonzero.
+    Falls back to zero loss if all entries are zero (avoids division by zero)."""
+    mask = X != 0
+    if mask.sum() == 0:
+        return torch.tensor(0.0, device=X.device, requires_grad=True)
+    return ((X_hat - X) ** 2)[mask].mean()
+
+
 # training function
 
 class Trainer():
@@ -505,7 +517,8 @@ class Trainer():
                 use_logging: Optional[bool]=True,
                 log_to_file: Optional[bool]=True,
                 loglevel: Optional[str]='INFO',
-                verbose: Optional[bool]=True, 
+                verbose: Optional[bool]=True,
+                use_masked_mse: Optional[bool]=True,
                 ):
         """
         Initializes the Trainer class with optional configurations.
@@ -541,11 +554,13 @@ class Trainer():
         self.save_output = save_output
         self.output_path = output_path
         self.verbose = verbose
+        self.use_masked_mse = use_masked_mse
         
         #set up logger
 
         if use_logging:
             if log_to_file:
+                os.makedirs(output_path, exist_ok=True)
                 logpath = os.path.join(output_path, 'logfile.txt')
             try:
                 self.logger = logging_config(logger_name="trainer",
@@ -685,7 +700,9 @@ class Trainer():
         
         # Loss functions
         A_recon_loss = nn.BCEWithLogitsLoss(reduction='mean')
-        X_recon_loss = nn.MSELoss(reduction='mean')
+        x_loss_fn = masked_mse_loss if self.use_masked_mse else (
+            lambda yhat, y: nn.functional.mse_loss(yhat, y)
+        )
         modularity_loss_fn = OptimizedModularityLoss()
         clustering_loss_fn = OptimizedClusterLoss()
         
@@ -749,7 +766,7 @@ class Trainer():
                     Mod_loss, Modloss_values, Clust_loss, Clustloss_values = mod_clust_output
 
                     # Reconstruction losses
-                    X_loss = X_recon_loss(X_hat, X_batch)
+                    X_loss = x_loss_fn(X_hat, X_batch)
                     A_loss = A_recon_loss(A_logit, A_batch)  # Use logits for numerical stability
 
                     # Total loss
@@ -772,7 +789,7 @@ class Trainer():
                     
                     # Update epoch losses
                     total_loss += batch_loss.item()
-                    self.logprint(f'batch loss: {batch_loss.item()}')
+                    self.logprint(f'[Train] Epoch {epoch + 1} Batch {batch_idx + 1}/{len(self.batch_indices_list)} loss: {batch_loss.item():.6f}')
                     train_epoch_losses['A'] += A_loss.item()
                     train_epoch_losses['X'] += X_loss.item()
                     
@@ -810,14 +827,35 @@ class Trainer():
                     )
 
                     if val_output[0] is not None:
-                        X_hat_val, A_hat_val = val_output[0], val_output[1]
+                        X_hat_val = val_output[0]
                         eval_X_dev = eval_X.to(device)
                         eval_A_dev = eval_A.to(device)
                         X_hat_dev = X_hat_val.to(device)
-                        A_hat_dev = A_hat_val.to(device)
 
-                        X_loss_val = X_recon_loss(X_hat_dev, eval_X_dev).item()
-                        A_loss_val = A_recon_loss(A_hat_dev, eval_A_dev).item()
+                        # Recompute forward pass to obtain raw A logits (index 2),
+                        # matching the training-side BCEWithLogitsLoss input.
+                        model.eval()
+                        with torch.no_grad():
+                            val_forward = model.forward(eval_X_dev, eval_A_dev)
+                        A_logit_dev = val_forward[2].to(device)
+
+                        # Per-batch validation loss (using same batch_size as training)
+                        n_val = eval_X_dev.shape[0]
+                        if self.use_batch_learning:
+                            val_bs = min(self.batch_size, n_val)
+                            val_batches = [torch.arange(i, min(i + val_bs, n_val))
+                                           for i in range(0, n_val, val_bs)]
+                        else:
+                            val_batches = [torch.arange(n_val)]
+
+                        for vb_idx, vb in enumerate(val_batches):
+                            X_loss_vb = x_loss_fn(X_hat_dev[vb], eval_X_dev[vb]).item()
+                            A_loss_vb = A_recon_loss(A_logit_dev[vb][:, vb], eval_A_dev[vb][:, vb]).item()
+                            vb_loss = A_loss_vb + self.gamma * X_loss_vb
+                            self.logprint(f'[Val]   Epoch {epoch + 1} Batch {vb_idx + 1}/{len(val_batches)} loss: {vb_loss:.6f}')
+
+                        X_loss_val = x_loss_fn(X_hat_dev, eval_X_dev).item()
+                        A_loss_val = A_recon_loss(A_logit_dev, eval_A_dev).item()
                         val_loss = A_loss_val + self.gamma * X_loss_val
                 forward_timing['validation'] += time.perf_counter() - _t0
 
@@ -859,7 +897,10 @@ class Trainer():
             
             epoch_time = time.time() - epoch_start
             if self.verbose:
-                self.logprint(f'Epoch {epoch + 1} completed in {epoch_time:.2f}s Training Loss: {total_loss:.4f}')
+                self.logprint(f'Epoch {epoch + 1} completed in {epoch_time:.2f}s')
+                self.logprint(f'  Total Training Loss:   {total_loss:.6f}')
+                if self.validation_data:
+                    self.logprint(f'  Total Validation Loss: {val_loss:.6f}')
                 self.logprint('-' * 50)
         
         # Final model output

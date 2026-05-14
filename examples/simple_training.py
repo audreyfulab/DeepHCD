@@ -22,7 +22,7 @@ start_time = time.perf_counter()
 # Configuration
 DATA_PATH = '/Users/jordandavis/Documents/DeepHCD_copy/DeepHCD/examples/very_small_graph_150'  # Path to simulated data
 #DATA_PATH = '/Users/audreyq.fu/Documents/GRN/Data/1k_node_graph/'
-OUTPUT_PATH = './test_150/'      # Path for training outputs
+OUTPUT_PATH = './test_nonzero_loss/'      # Path for training outputs
 #OUTPUT_PATH = '/Users/audreyq.fu/Documents/GRN/Data/1k_node_graph/training_output/'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 

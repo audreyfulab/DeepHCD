@@ -96,7 +96,7 @@ def compute_beth_hess_comms(A: torch.Tensor):
     avg_degree = torch.mm(torch.mm(torch.ones((N,1)).T, A), torch.ones((N, 1)))/N
     eta = torch.sqrt(avg_degree)
     Bethe_Hessian = (torch.square(eta)-1)*torch.diag(torch.ones(N))+Deg - eta*A
-    eigvals = torch.linalg.eigh(Bethe_Hessian)[0]
+    eigvals = torch.tensor(spy.linalg.eigvalsh(Bethe_Hessian.numpy()))
     k = torch.sum(eigvals<0)
     return int(k)
 

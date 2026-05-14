@@ -133,7 +133,7 @@ TARGET_CELL_TYPES = ['epidermis', 'midgut']
 
 # Subsetting: use stratified sampling so both cell types are represented
 USE_SUBSET    = True
-SUBSET_SIZE   = 500    # total cells after filter; set to None to use all
+SUBSET_SIZE   = 2000    # total cells after filter; set to None to use all
 SUBSET_METHOD = 'stratified'
 RANDOM_SEED   = 42
 
@@ -144,7 +144,7 @@ H5AD_PATH = os.environ.get(
 )
 OUTPUT_PATH = os.environ.get(
     'DEEPHCD_OUTPUT_DIR',
-    os.path.join(_SCRIPT_DIR, 'epidermis_midgut_100PC_500Subset_npcorr')
+    os.path.join(_SCRIPT_DIR, 'epidermis_midgut_test_nonzero_loss')
 )
 DEVICE  = 'cuda' if torch.cuda.is_available() else 'cpu'
 N_PCS   = 100
@@ -383,7 +383,8 @@ else:
 
 EARLY_STOPPING = True
 PATIENCE = 10
-PLOT_HEATMAPS = True
+PLOT_HEATMAPS = False
+PLOT_TSNE     = True
 
 with StepTimer("Step 4: Model Creation"):
     model = HCD(
@@ -603,6 +604,125 @@ if IS_MAIN:
 
             except Exception as e:
                 log(f"Heatmap generation failed: {e}")
+
+    # ── t-SNE plots ───────────────────────────────────────────────────────────
+    if not PLOT_TSNE:
+        log("t-SNE generation skipped (PLOT_TSNE=False)")
+    if PLOT_TSNE:
+        with StepTimer("Step 8: t-SNE"):
+            try:
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as plt
+                from sklearn.manifold import TSNE
+
+                top_preds = output.predicted_train.get('top')
+                mid_preds = output.predicted_train.get('middle')
+                top_arr = top_preds.cpu().numpy() if top_preds is not None else None
+                mid_arr = mid_preds.cpu().numpy() if mid_preds is not None else None
+                _n = (len(top_arr) if top_arr is not None else
+                      len(mid_arr) if mid_arr is not None else len(cells_filtered))
+
+                X_np_plot = X.numpy()[:_n]
+
+                log("  Running t-SNE (this may take a moment)...")
+                tsne = TSNE(n_components=2, random_state=RANDOM_SEED,
+                            perplexity=min(30, _n - 1), max_iter=1000)
+                embedding = tsne.fit_transform(X_np_plot)
+
+                true_labels_plot = np.array(
+                    [sorted_types[v] for v in ct_labels_filtered[:_n]]
+                )
+
+                # Neon palette — maximally distinct, high-saturation colors
+                NEON_PALETTE = [
+                    '#FF00FF',  # magenta
+                    '#00FFFF',  # cyan
+                    '#39FF14',  # neon green
+                    '#FFFF00',  # neon yellow
+                    '#FF6EC7',  # neon pink
+                    '#FF5F1F',  # neon orange
+                    '#BC13FE',  # neon purple
+                    '#1F51FF',  # neon blue
+                    '#CCFF00',  # electric lime
+                    '#FF073A',  # neon red
+                    '#00FF9F',  # neon mint
+                    '#FE4164',  # neon rose
+                    '#04D9FF',  # electric blue
+                    '#F4FF61',  # neon chartreuse
+                    '#FF9933',  # neon tangerine
+                    '#8AFF00',  # neon spring green
+                    '#FA00FF',  # neon fuchsia
+                    '#00FFEF',  # neon turquoise
+                    '#FFB200',  # neon amber
+                    '#D5FF00',  # neon citron
+                ]
+
+                def _tsne_scatter(ax, embedding, labels, title, cmap=None):
+                    unique = sorted(set(labels))
+                    n = max(len(unique), 1)
+                    colors = [NEON_PALETTE[i % len(NEON_PALETTE)] for i in range(n)]
+                    for color, label in zip(colors, unique):
+                        mask = labels == label
+                        ax.scatter(embedding[mask, 0], embedding[mask, 1],
+                                   c=[color], label=str(label),
+                                   s=8, alpha=0.6, linewidths=0)
+                    ax.set_title(title)
+                    ax.set_xlabel('t-SNE 1')
+                    ax.set_ylabel('t-SNE 2')
+                    ax.legend(markerscale=2, fontsize=7,
+                              loc='best', framealpha=0.7)
+
+                # ── Plot 1: coloured by true cell type ────────────────────────
+                fig, ax = plt.subplots(figsize=(7, 6))
+                _tsne_scatter(ax, embedding, true_labels_plot,
+                              't-SNE — True Cell Type', cmap='Set1')
+                plt.tight_layout()
+                p = os.path.join(OUTPUT_PATH, 'tsne_true_cell_type.png')
+                plt.savefig(p, dpi=150)
+                plt.close()
+                log(f"  Saved: {p}")
+
+                # ── Plot 2: coloured by predicted top cluster ─────────────────
+                if top_arr is not None:
+                    fig, ax = plt.subplots(figsize=(7, 6))
+                    _tsne_scatter(ax, embedding, top_arr[:_n].astype(str),
+                                  't-SNE — Predicted Top Cluster')
+                    plt.tight_layout()
+                    p = os.path.join(OUTPUT_PATH, 'tsne_top_cluster.png')
+                    plt.savefig(p, dpi=150)
+                    plt.close()
+                    log(f"  Saved: {p}")
+
+                # ── Plot 3: coloured by predicted middle cluster ───────────────
+                if mid_arr is not None:
+                    fig, ax = plt.subplots(figsize=(7, 6))
+                    _tsne_scatter(ax, embedding, mid_arr[:_n].astype(str),
+                                  't-SNE — Predicted Middle Cluster')
+                    plt.tight_layout()
+                    p = os.path.join(OUTPUT_PATH, 'tsne_middle_cluster.png')
+                    plt.savefig(p, dpi=150)
+                    plt.close()
+                    log(f"  Saved: {p}")
+
+                # ── Plot 4: side-by-side true vs top predicted ────────────────
+                fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+                _tsne_scatter(axes[0], embedding, true_labels_plot,
+                              'True Cell Type', cmap='Set1')
+                if top_arr is not None:
+                    _tsne_scatter(axes[1], embedding, top_arr[:_n].astype(str),
+                                  'Predicted Top Cluster')
+                else:
+                    axes[1].set_visible(False)
+                plt.suptitle('t-SNE: True vs Predicted', fontsize=13)
+                plt.tight_layout()
+                p = os.path.join(OUTPUT_PATH, 'tsne_comparison.png')
+                plt.savefig(p, dpi=150)
+                plt.close()
+                log(f"  Saved: {p}")
+
+            except Exception as e:
+                log(f"t-SNE generation failed: {e}")
 
     # ── Timing summary ─────────────────────────────────────────────────────────
     tracemalloc.stop()
