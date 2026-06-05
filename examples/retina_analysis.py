@@ -6,15 +6,16 @@ os.environ['OPENBLAS_NUM_THREADS'] = '1'
 import pandas as pd
 import loompy
 from sklearn.decomposition import TruncatedSVD
+from sklearn.manifold import TSNE
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 NEON_PALETTE = [
-    '#FF00FF', '#00FFFF', '#39FF14', '#FFFF00', '#FF6EC7',
+    '#FF00FF', '#00FFFF', "#127B00", "#725A02", '#FF6EC7',
     '#FF5F1F', '#BC13FE', '#1F51FF', '#CCFF00', '#FF073A',
-    '#00FF9F', '#FE4164', '#04D9FF', '#F4FF61', '#FF9933',
-    '#8AFF00', '#FA00FF', '#00FFEF', '#FFB200', '#D5FF00',
+    '#00FF9F', '#FE4164', '#04D9FF', "#000000", '#FF9933',
+    "#11FF00", '#FA00FF', '#00FFEF', '#FFB200', "#D6B0FF",
 ]
 NEON_CMAP = ListedColormap(NEON_PALETTE)
 import numpy as np
@@ -28,7 +29,7 @@ from deephcd.model.train import Trainer
 
 
 RUN_UMAP_ORIGINAL = False
-TSNE = False
+RUN_TSNE = False
 SUBSET = 500
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 OUTPUT_PATH = './retina_training_results/'
@@ -59,7 +60,7 @@ print("\nRunning PCA (50 components)...")
 pca = TruncatedSVD(n_components=100, random_state=42)
 X_pca = pca.fit_transform(X_dense)
 
-if TSNE:
+if RUN_TSNE:
     n_cells = X_pca.shape[0]
     print(f"\nRunning t-SNE on {n_cells} cells...")
     tsne = TSNE(n_components=2, random_state=42,perplexity=min(30, n_cells - 1), max_iter=1000)

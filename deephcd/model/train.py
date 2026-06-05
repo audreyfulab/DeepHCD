@@ -501,9 +501,9 @@ class Trainer():
                 epochs: Optional[int]=50, 
                 update_interval: Optional[int]=10, 
                 learning_rate: Optional[float]=1e-4, 
-                gamma: Optional[int]=1,
-                delta: Optional[int]=1,
-                _lambda: Optional[int | List[int]]=1,
+                gamma: Optional[int]=4,
+                delta: Optional[int]=10,
+                _lambda: Optional[int | List[int]]=[1/60, 1/20],
                 graph_resolutions: Optional[List[int]]=[1,1], 
                 k: Optional[int]=2,  
                 batch_size: Optional[int]=64, 
@@ -772,7 +772,17 @@ class Trainer():
                     # Total loss
                     batch_loss = A_loss + self.gamma * X_loss + Clust_loss - self.delta * Mod_loss
                     forward_timing['loss_compute'] += time.perf_counter() - _t0
-                    self.logprint(f'A_loss: {A_loss} X_loss: {X_loss} Clust_loss: {Clust_loss} Mod_loss: {Mod_loss}')
+                    A_v = A_loss.item()
+                    X_v = X_loss.item()
+                    C_v = Clust_loss.item() if torch.is_tensor(Clust_loss) else float(Clust_loss)
+                    M_v = Mod_loss.item()   if torch.is_tensor(Mod_loss)   else float(Mod_loss)
+                    gX = self.gamma * X_v
+                    dM = self.delta * M_v
+                    self.logprint(
+                        f'A_loss={A_v:.4f}  gamma*X_loss={gX:.4f} (X={X_v:.4f}, gamma={self.gamma})  '
+                        f'Clust_loss={C_v:.4f}  delta*Mod_loss={dM:.4f} (Mod={M_v:.4f}, delta={self.delta})  '
+                        f'=> batch_loss={A_v + gX + C_v - dM:.4f}'
+                    )
 
                     # Backward pass
                     _t0 = time.perf_counter()
@@ -805,19 +815,33 @@ class Trainer():
                         torch.cuda.empty_cache()
                     forward_timing['gpu_cleanup'] += time.perf_counter() - _t0
             
+            # Average training losses across batches so they're on the same
+            # per-pass scale as the validation losses computed below.
+            n_batches = len(self.batch_indices_list)
+            denom = n_batches if n_batches > 0 else 1
+            avg_total_loss = total_loss / denom
+            avg_A = train_epoch_losses['A'] / denom
+            avg_X = train_epoch_losses['X'] / denom
+            avg_mod = np.array(train_epoch_losses['mod']) / denom
+            avg_clust = np.array(train_epoch_losses['clust']) / denom
+
             # Store training history
             train_loss_history.append({
-                'Total Loss': total_loss,
-                'A Reconstruction': train_epoch_losses['A'],
-                'X Reconstruction': self.gamma * train_epoch_losses['X'],
-                'Modularity': self.delta * np.array(train_epoch_losses['mod']),
-                'Clustering': np.array(train_epoch_losses['clust'])
+                'Total Loss': avg_total_loss,
+                'A Reconstruction': avg_A,
+                'X Reconstruction': self.gamma * avg_X,
+                'Modularity': self.delta * avg_mod,
+                'Clustering': avg_clust
             })
             
             # Evaluation (less frequent to save memory)
             val_loss = 0.0
             A_loss_val = 0.0
             X_loss_val = 0.0
+            Mod_loss_val_item = 0.0
+            Clust_loss_val_item = 0.0
+            Modloss_values_val = [0.0] * len(model.comm_sizes)
+            Clustloss_values_val = [0.0] * len(model.comm_sizes)
             if self.validation_data:
                 eval_X, eval_A, eval_labels = self.validation_data
                 _t0 = time.perf_counter()
@@ -839,6 +863,26 @@ class Trainer():
                             val_forward = model.forward(eval_X_dev, eval_A_dev)
                         A_logit_dev = val_forward[2].to(device)
 
+                        # Modularity + clustering losses on the validation forward output
+                        val_X_hat, val_A_hat, val_A_logit, val_X_all, val_A_all, val_P_all, val_S_all, val_AW = val_forward
+                        val_P_all = [
+                            p.to(device) if torch.is_tensor(p)
+                            else [q.to(device) for q in p]
+                            for p in val_P_all
+                        ]
+                        val_forward_on_device = (
+                            val_X_hat, val_A_hat, val_A_logit,
+                            val_X_all, val_A_all, val_P_all, val_S_all, val_AW
+                        )
+                        with torch.no_grad():
+                            Mod_loss_val, Modloss_values_val, Clust_loss_val, Clustloss_values_val = self.get_mod_clust_losses(
+                                model, eval_X_dev, eval_A_dev, val_forward_on_device,
+                                self._lambda, self.graph_resolutions,
+                                modularity_loss_fn, clustering_loss_fn
+                            )
+                        Mod_loss_val_item = Mod_loss_val.item() if torch.is_tensor(Mod_loss_val) else float(Mod_loss_val)
+                        Clust_loss_val_item = Clust_loss_val.item() if torch.is_tensor(Clust_loss_val) else float(Clust_loss_val)
+
                         # Per-batch validation loss (using same batch_size as training)
                         n_val = eval_X_dev.shape[0]
                         if self.use_batch_learning:
@@ -856,12 +900,23 @@ class Trainer():
 
                         X_loss_val = x_loss_fn(X_hat_dev, eval_X_dev).item()
                         A_loss_val = A_recon_loss(A_logit_dev, eval_A_dev).item()
-                        val_loss = A_loss_val + self.gamma * X_loss_val
+                        val_loss = (
+                            A_loss_val
+                            + self.gamma * X_loss_val
+                            + Clust_loss_val_item
+                            - self.delta * Mod_loss_val_item
+                        )
                 forward_timing['validation'] += time.perf_counter() - _t0
 
 
             if self.validation_data:
-                val_loss_history.append({'Total Loss': val_loss})
+                val_loss_history.append({
+                    'Total Loss': val_loss,
+                    'A Reconstruction': A_loss_val,
+                    'X Reconstruction': self.gamma * X_loss_val,
+                    'Modularity': self.delta * np.array(Modloss_values_val),
+                    'Clustering': np.array(Clustloss_values_val),
+                })
             
             # Performance evaluation (periodic)
             if epoch % self.update_interval == 0:
@@ -883,12 +938,10 @@ class Trainer():
                 self.logprint(f"""Early Stopping Start:
                               A_loss_val: {A_loss_val}
                               X_loss_val: {X_loss_val}
-                              Training Loss: {total_loss}
+                              Avg Training Loss (per batch): {avg_total_loss}
                               Validation Loss: {val_loss}
                               """)
-                n_batches = len(self.batch_indices_list)
-                avg_train_loss = total_loss / n_batches if n_batches > 0 else total_loss
-                loss_value = val_loss if self.validation_data else avg_train_loss
+                loss_value = val_loss if self.validation_data else avg_total_loss
                 loss_type = 'validation' if self.validation_data else 'total'
                 early_stop(loss_value, model, loss_type)
                 if early_stop.early_stop:
@@ -898,7 +951,7 @@ class Trainer():
             epoch_time = time.time() - epoch_start
             if self.verbose:
                 self.logprint(f'Epoch {epoch + 1} completed in {epoch_time:.2f}s')
-                self.logprint(f'  Total Training Loss:   {total_loss:.6f}')
+                self.logprint(f'  Avg Training Loss (per batch): {avg_total_loss:.6f}  (sum across {n_batches} batches: {total_loss:.6f})')
                 if self.validation_data:
                     self.logprint(f'  Total Validation Loss: {val_loss:.6f}')
                 self.logprint('-' * 50)
