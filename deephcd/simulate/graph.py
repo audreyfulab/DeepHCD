@@ -1,7 +1,8 @@
 import networkx as nx
 import numpy as np
+import scipy.sparse as sp
 from random import randint as rd
-from typing import List, Tuple    
+from typing import List, Tuple
 
 
 
@@ -333,18 +334,32 @@ def generate_pseudo_expression(topological_order: List,
    
     N = len(topological_order)
     pseudo_expression = np.zeros((N, number_of_invididuals))
-    
+
+    # Accept either a dense ndarray or a SciPy sparse adjacency matrix. Sparse
+    # input keeps memory at O(nnz) instead of O(N^2), which matters for large
+    # graphs (e.g. ~20k nodes would otherwise need ~3 GB of dense float per copy).
+    sparse_input = sp.issparse(adjacency_matrix)
+
     # PRE-COMPUTE: Find all parent relationships at once (O(N) instead of O(N²) per node)
     # This replaces the expensive per-node adjacency matrix scanning
-    parent_counts = np.sum(adjacency_matrix, axis=0)  # Count parents for each node
+    parent_counts = np.asarray(adjacency_matrix.sum(axis=0)).ravel()  # Count parents for each node
     root_mask = (parent_counts == 0)  # Identify root nodes
     root_indices = np.where(root_mask)[0]  # Get root node indices
-    
+
     # Pre-compute parent indices for all non-root nodes
     parent_dict = {}
-    for col_idx in range(N):
-        if not root_mask[col_idx]:  # Only for non-root nodes
-            parent_dict[col_idx] = np.where(adjacency_matrix[:, col_idx] == 1)[0]
+    if sparse_input:
+        # CSC lets us read each column's nonzero row indices (the parents) in
+        # O(nnz) total via the indptr/indices arrays.
+        csc = adjacency_matrix.tocsc()
+        indptr, indices = csc.indptr, csc.indices
+        for col_idx in range(N):
+            if not root_mask[col_idx]:  # Only for non-root nodes
+                parent_dict[col_idx] = indices[indptr[col_idx]:indptr[col_idx + 1]]
+    else:
+        for col_idx in range(N):
+            if not root_mask[col_idx]:  # Only for non-root nodes
+                parent_dict[col_idx] = np.where(adjacency_matrix[:, col_idx] == 1)[0]
     
     # STEP 1: Initialize all root nodes at once (vectorized)
     origin_nodes = [[idx, topological_order[idx]] for idx in root_indices]
@@ -418,20 +433,35 @@ def generate_pseudo_expression_weighted(topological_order: List,
 
     N = len(topological_order)
     pseudo_expression = np.zeros((N, number_of_invididuals))
-    
+
+    # Accept either a dense ndarray or a SciPy sparse (weighted) adjacency matrix.
+    sparse_input = sp.issparse(adjacency_matrix)
+
     # PRE-COMPUTE: Find parent relationships (for weighted case)
-    parent_counts = np.sum(adjacency_matrix != 0, axis=0)  # Count non-zero parents
-    root_mask = (parent_counts == 0)
-    root_indices = np.where(root_mask)[0]
-    
-    # Pre-compute parent indices and weights
     parent_dict = {}
     weight_dict = {}
-    for col_idx in range(N):
-        if not root_mask[col_idx]:
-            parent_indices = np.where(adjacency_matrix[:, col_idx] != 0)[0]
-            parent_dict[col_idx] = parent_indices
-            weight_dict[col_idx] = adjacency_matrix[parent_indices, col_idx]
+    if sparse_input:
+        # CSC: nnz per column gives the parent count; indices/data slices give the
+        # parent row indices and their edge weights in O(nnz) total.
+        csc = adjacency_matrix.tocsc()
+        indptr, indices, data = csc.indptr, csc.indices, csc.data
+        parent_counts = np.diff(indptr)  # Count non-zero parents
+        root_mask = (parent_counts == 0)
+        root_indices = np.where(root_mask)[0]
+        for col_idx in range(N):
+            if not root_mask[col_idx]:
+                col_slice = slice(indptr[col_idx], indptr[col_idx + 1])
+                parent_dict[col_idx] = indices[col_slice]
+                weight_dict[col_idx] = data[col_slice]
+    else:
+        parent_counts = np.sum(adjacency_matrix != 0, axis=0)  # Count non-zero parents
+        root_mask = (parent_counts == 0)
+        root_indices = np.where(root_mask)[0]
+        for col_idx in range(N):
+            if not root_mask[col_idx]:
+                parent_indices = np.where(adjacency_matrix[:, col_idx] != 0)[0]
+                parent_dict[col_idx] = parent_indices
+                weight_dict[col_idx] = adjacency_matrix[parent_indices, col_idx]
     
     # Initialize root nodes
     origin_nodes = [[idx, topological_order[idx]] for idx in root_indices]

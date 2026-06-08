@@ -86,8 +86,9 @@ def simulate_graph(args):
         h1_graph = nx.DiGraph([(u,v) for (u,v) in h1_graph.edges() if u!=v])
 
         #draw directed graph
-        fig, ax = plt.subplots(figsize = (14,10))
-        topfig = plot_diGraph(fig, ax, h1_graph, return_fig=True)
+        if args.save_pdf or args.save_png:
+            fig, ax = plt.subplots(figsize = (14,10))
+            topfig = plot_diGraph(fig, ax, h1_graph, return_fig=True)
 
         if args.save_pdf:
             topfig.savefig(args.savepath+'top_layer_graph.pdf')
@@ -108,10 +109,13 @@ def simulate_graph(args):
 
         #draw top graph
         #draw directed graph
-        fig, ax = plt.subplots(figsize = (14,10))
-        topfig = plot_diGraph(fig, ax, h1_graph, return_fig=True)
-        topfig.savefig(args.savepath+'top_layer_graph.pdf')
-        topfig.savefig(args.savepath+'top_layer_graph.png', dpi = 500)
+        if args.save_pdf or args.save_png:
+            fig, ax = plt.subplots(figsize = (14,10))
+            topfig = plot_diGraph(fig, ax, h1_graph, return_fig=True)
+        if args.save_pdf:    
+            topfig.savefig(args.savepath+'top_layer_graph.pdf')
+        if args.save_png:
+            topfig.savefig(args.savepath+'top_layer_graph.png', dpi = 500)
 
         #sort toplayer
         ts_h1_graph = list(h1_graph.nodes())
@@ -163,16 +167,22 @@ def simulate_graph(args):
     #handle two layer networks
     if args.layers == 2:
         #draw top layer
-        fig, ax = plt.subplots(figsize = (14,10))
-        midfig = plot_diGraph(fig, ax, h2_graph, return_fig=True, draw_edge_weights = True)
-        midfig.savefig(args.savepath+'bottom_layer_graph.pdf')
-        midfig.savefig(args.savepath+'bottom_layer_graph.png', dpi = 500)
+        if args.save_pdf or args.save_png:
+            fig, ax = plt.subplots(figsize = (14,10))
+            midfig = plot_diGraph(fig, ax, h2_graph, return_fig=True, draw_edge_weights = True)
+        if args.save_pdf:
+            midfig.savefig(args.savepath+'bottom_layer_graph.pdf')
+        if args.save_png:    
+            midfig.savefig(args.savepath+'bottom_layer_graph.png', dpi = 500)
     else:
         #draw top layer
-        fig, ax = plt.subplots(figsize = (14,10))
-        midfig = plot_diGraph(fig, ax, h2_graph, return_fig=True, draw_edge_weights = False)
-        midfig.savefig(args.savepath+'middle_layer_graph.pdf')
-        midfig.savefig(args.savepath+'middle_layer_graph.png', dpi = 500)
+        if args.save_pdf or args.save_png:
+            fig, ax = plt.subplots(figsize = (14,10))
+            midfig = plot_diGraph(fig, ax, h2_graph, return_fig=True, draw_edge_weights = False)
+        if args.save_pdf:    
+            midfig.savefig(args.savepath+'middle_layer_graph.pdf')
+        if args.save_png:
+            midfig.savefig(args.savepath+'middle_layer_graph.png', dpi = 500)
         
         #generate bottom layer of the network
         h3_graph, subgraphs3 = hierachical_graph(top_graph=h2_graph, 
@@ -190,13 +200,15 @@ def simulate_graph(args):
         
         #topo sort 
         ts_h3_graph = list(nx.topological_sort(h3_graph))
-        adj_h3_graph = nx.adjacency_matrix(h3_graph, ts_h3_graph).todense()
         
         #draw middle layer
-        fig, ax = plt.subplots(figsize = (14,10))
-        botfig = plot_diGraph(fig, ax, h3_graph, return_fig=True)
-        botfig.savefig(args.savepath+'bottom_layer_graph.pdf')
-        botfig.savefig(args.savepath+'bottom_layer_graph.png', dpi = 500)
+        if args.save_pdf or args.save_png:
+            fig, ax = plt.subplots(figsize = (14,10))
+            botfig = plot_diGraph(fig, ax, h3_graph, return_fig=True)
+        if args.save_pdf:    
+            botfig.savefig(args.savepath+'bottom_layer_graph.pdf')
+        if args.save_png:
+            botfig.savefig(args.savepath+'bottom_layer_graph.png', dpi = 500)
         
         #print toplayer attributes
         print('-'*60)
@@ -214,20 +226,22 @@ def simulate_graph(args):
     #convert topology to undirected 
     h1_undi = h1_graph.to_undirected()
     h2_undi = h2_graph.to_undirected()
-    h1_undi_adj = nx.to_numpy_array(h1_undi)
-    h2_undi_adj = nx.to_numpy_array(h2_undi)
+    h1_undi_adj = nx.to_numpy_array(h1_undi, dtype=np.float32)
+    h2_undi_adj = nx.to_numpy_array(h2_undi, dtype=np.float32)
     if args.layers == 2:
-        
+
         ts_full = ts_h2_graph
-        adj_full = nx.adjacency_matrix(h2_graph, ts_full).todense()
+        # Keep the full adjacency sparse (float32 CSC) for pseudo-expression
+        # generation so we never materialize an N x N dense matrix.
+        adj_full = nx.adjacency_matrix(h2_graph, ts_full).astype(np.float32).tocsc()
         print(len(ts_full), adj_full.shape)
     
     else:
 
         h3_undi = h3_graph.to_undirected()
-        h3_undi_adj = nx.to_numpy_array(h3_undi)
+        h3_undi_adj = nx.to_numpy_array(h3_undi, dtype=np.float32)
         ts_full = list(nx.topological_sort(h3_graph))
-        adj_full = nx.adjacency_matrix(h3_graph, ts_full).todense()
+        adj_full = nx.adjacency_matrix(h3_graph, ts_full).astype(np.float32).tocsc()
         
     print(len(ts_full), adj_full.shape)
     convert_time_end = time.time()
@@ -300,14 +314,18 @@ def simulate_graph(args):
     #make plot of data and graph
     fig, ax = plt.subplots(1,2, figsize = (16, 10))
     if args.layers > 2:
-        sbn.heatmap(h3_undi_adj, ax = ax[1])
-        sbn.heatmap(np.corrcoef(pe[indices_mid, :]), ax = ax[0])
+        if args.save_pdf or args.save_png:
+            sbn.heatmap(h3_undi_adj, ax = ax[1])
+            sbn.heatmap(np.corrcoef(pe[indices_mid, :]), ax = ax[0])
     else:
-        sbn.heatmap(h2_undi_adj, ax = ax[1])
-        sbn.heatmap(np.corrcoef(pe[indices_top, :]), ax = ax[0])
+        if args.save_pdf or args.save_png:
+            sbn.heatmap(h2_undi_adj, ax = ax[1])
+            sbn.heatmap(np.corrcoef(pe[indices_top, :]), ax = ax[0])
     
-    fig.savefig(args.savepath+'heatmaps.pdf')
-    fig.savefig(args.savepath+'heatmaps.png', dpi = 500)
+    if args.save_pdf:
+        fig.savefig(args.savepath+'heatmaps.pdf')
+    if args.save_png:    
+        fig.savefig(args.savepath+'heatmaps.png', dpi = 500)
     
     #close all open figures
     plt.close('all')
