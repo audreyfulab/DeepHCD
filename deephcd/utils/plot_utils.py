@@ -6,50 +6,50 @@ import numpy as np
 
 # a simple function to plot the loss curves during training
 #----------------------------------------------------------------
-def plot_loss(epoch, layers, train_loss_history, test_loss_history, true_losses = None, path='path/to/file', save = True):
-    
-    
-    
+def plot_loss(epoch, layers, train_loss_history, validation_loss_history, true_losses = None, path='path/to/file', save = True):
+
+
+
     total_train = [i['Total Loss'] for i in train_loss_history]
-    total_test =[i['Total Loss'] for i in test_loss_history]
-    
+    total_val =[i['Total Loss'] for i in validation_loss_history]
+
     recon_A_train = [i['A Reconstruction'] for i in train_loss_history]
-    recon_A_test = [i['A Reconstruction'] for i in test_loss_history]
-    
+    recon_A_val = [i['A Reconstruction'] for i in validation_loss_history]
+
     recon_X_train = [i['X Reconstruction'] for i in train_loss_history]
-    recon_X_test = [i['X Reconstruction'] for i in test_loss_history]
-    
+    recon_X_val = [i['X Reconstruction'] for i in validation_loss_history]
+
     mod_train = [i['Modularity'] for i in train_loss_history]
-    mod_test = [i['Modularity'] for i in test_loss_history]
-    
+    mod_val = [i['Modularity'] for i in validation_loss_history]
+
     clust_train = [i['Clustering'] for i in train_loss_history]
-    clust_test = [i['Clustering'] for i in test_loss_history]
-    
-    
+    clust_val = [i['Clustering'] for i in validation_loss_history]
+
+
     fig, (ax1, ax2, ax3) = plt.subplots(3,2, figsize=(12,10))
     #total loss
     ln1, = ax1[0].plot(range(0, epoch+1), total_train, label = 'Train')
-    ln2, = ax1[0].plot(range(0, epoch+1), total_test, linestyle = 'dashed', label = 'Test')
+    ln2, = ax1[0].plot(range(0, epoch+1), total_val, linestyle = 'dashed', label = 'Validation')
     ax1[0].set_xlabel('Training Epochs')
     ax1[0].set_ylabel('Total Loss')
     #reconstruction of graph adjacency
     ln3, = ax1[1].plot(range(0, epoch+1), recon_A_train, label = 'Train')
-    ln4, = ax1[1].plot(range(0, epoch+1), recon_A_test, linestyle = 'dashed',  label = 'Test')
+    ln4, = ax1[1].plot(range(0, epoch+1), recon_A_val, linestyle = 'dashed',  label = 'Validation')
     ax1[1].set_xlabel('Training Epochs')
     ax1[1].set_ylabel('Graph Reconstruction Loss')
     #reconstruction of node attributes
     ln5, = ax2[0].plot(range(0, epoch+1), recon_X_train, label = 'Train')
-    ln6, = ax2[0].plot(range(0, epoch+1), recon_X_test, linestyle = 'dashed', label = 'Test')
+    ln6, = ax2[0].plot(range(0, epoch+1), recon_X_val, linestyle = 'dashed', label = 'Validation')
     ax2[0].set_xlabel('Training Epochs')
     ax2[0].set_ylabel('Gamma * Attribute Reconstruction Loss')
     #community loss using modularity
     lines1a, lines1b = ax2[1].plot(range(0, epoch+1), np.array(mod_train), label = ['train top', 'train middle'])
-    lines2a, lines2b = ax2[1].plot(range(0, epoch+1), np.array(mod_test), label = ['test top', 'test middle'], linestyle = 'dashed')
+    lines2a, lines2b = ax2[1].plot(range(0, epoch+1), np.array(mod_val), label = ['val top', 'val middle'], linestyle = 'dashed')
     ax2[1].set_xlabel('Training Epochs')
     ax2[1].set_ylabel('Delta * Modularity')
     #community loss using kmeans
     lines3a, lines3b = ax3[0].plot(range(0, epoch+1), np.array(clust_train), label = ['train top', 'train middle'])
-    lines4a, lines4b = ax3[0].plot(range(0, epoch+1), np.array(clust_test), label = ['test top', 'test middle'], linestyle ='dashed')
+    lines4a, lines4b = ax3[0].plot(range(0, epoch+1), np.array(clust_val), label = ['val top', 'val middle'], linestyle ='dashed')
     if true_losses:
         ax3[0].axhline(y=true_losses[0], color='black', linestyle='dotted', linewidth=2)
         ax3[0].axhline(y=true_losses[1], color='black', linestyle='dotted', linewidth=2)

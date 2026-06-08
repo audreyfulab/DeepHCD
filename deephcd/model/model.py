@@ -7,6 +7,41 @@ from collections import OrderedDict
 from torchinfo import summary
 from torch_kmeans import SoftKMeans
 from typing import Optional, Union, List,  Literal
+import numpy as np
+import os
+import time
+
+# Accumulated timing across all forward() calls (reset by training script between epochs)
+forward_timing = {
+    # forward pass breakdown
+    'total_forward': 0.0,
+    'input_norm': 0.0,
+    'edge_index': 0.0,
+    'gate_encoder': 0.0,
+    'dot_product': 0.0,
+    'gate_decoder': 0.0,
+    'output_layers': 0.0,
+    'top_comm': 0.0,
+    'select_subsets': 0.0,
+    'middle_comm': 0.0,
+    'clustering': 0.0,
+    # per-batch training overhead
+    'batch_prep': 0.0,
+    'loss_compute': 0.0,
+    'backward': 0.0,
+    'grad_clip': 0.0,
+    'optimizer_step': 0.0,
+    'gpu_cleanup': 0.0,
+    # epoch-level overhead
+    'validation': 0.0,
+    'perf_eval': 0.0,
+    'calls': 0,
+}
+
+def reset_forward_timing():
+    """Reset accumulated forward-pass timing stats."""
+    for key in forward_timing:
+        forward_timing[key] = 0.0 if key != 'calls' else 0
 
 
 def select_class(X: torch.Tensor, labels: torch.Tensor, k: int, dim: int = 0, return_index: bool = False):
@@ -84,14 +119,13 @@ class GATE(nn.Module):
         self.seqmodel = nn.Sequential(module_dict)
         
         
-    def forward(self, X, A):
+    def forward(self, X, A, ei=None, ea=None):
         weights_list = []
-        ei, ea = pyg_utils.dense_to_sparse(A)
-        #A_SPT = pyg_utils.to_torch_csr_tensor(Asparse[0], Asparse[1])
-        #ei, ea = pyg_utils.to_edge_index(A_SPT)
+        if ei is None:
+            ei, ea = pyg_utils.dense_to_sparse(A)
         H, E, attr, weights_list = self.seqmodel((X, ei, ea, weights_list))
-        
-        return (H, A, weights_list) 
+
+        return (H, A, weights_list)
     
 
     
@@ -166,10 +200,13 @@ class CommunityDetectionLayers(nn.Module):
         self.model = nn.Sequential(module_dict)
         
         
-    def forward(self, Z, A):
-        H_layers = self.model([Z, A, [], [], [], []])
-        
-        return H_layers
+    def forward(self, Z, A, ei=None, ea=None):
+        inputs = [Z, A, [], [], [], []]
+        if ei is not None:
+            inputs.append(ei)
+        H_layers = self.model(inputs)
+
+        return H_layers[:6]
         
 
 
@@ -311,108 +348,152 @@ class HCD(nn.Module):
         self.dpd_norm = nn.Identity()
         
         
-    def forward(self, X, A):
-        
-        #normalize input
-        H = self.input_norm(X)
-        
-        #get embedding representation
-        Z, A, encoder_attention_weights = self.encoder(H,A)
-        
-        sim = torch.mm(Z, Z.T)
-        sim = torch.clamp(sim, -10, 10)
-        A_hat = self.dpd_act(self.dpd_norm(sim))
+    def forward(self, X, A, ei=None, ea=None):
+        _t_forward = time.perf_counter()
+        device = X.device
 
+        self.to(device)
+
+        if hasattr(self.input_norm, 'weight') and self.input_norm.weight.device != X.device:
+           self.input_norm = self.input_norm.to(X.device)
+
+        # normalize input
+        _t0 = time.perf_counter()
+        H = self.input_norm(X)
+        forward_timing['input_norm'] += time.perf_counter() - _t0
+
+        # Pre-compute sparse edge_index once for the full batch A so encoder,
+        # decoder, and top community module all reuse it without re-scanning A.
+        if ei is None:
+            _t0 = time.perf_counter()
+            ei, ea = pyg_utils.dense_to_sparse(A)
+            forward_timing['edge_index'] += time.perf_counter() - _t0
+
+        # get embedding representation
+        _t0 = time.perf_counter()
+        Z, A, encoder_attention_weights = self.encoder(H, A, ei=ei, ea=ea)
+        forward_timing['gate_encoder'] += time.perf_counter() - _t0
+
+        # Normalize embeddings and compute dot-product reconstruction
+        _t0 = time.perf_counter()
+        Z_norm = F.normalize(Z, p=2, dim=1)
+        sim = torch.mm(Z_norm, Z_norm.T)
+        A_hat = self.dpd_act(sim)
+        sim = torch.clamp(sim, -10, 10)
         A_logits = self.dpd_norm(torch.mm(Z, Z.transpose(0,1)))
-        #A_hat = self.dpd_act(self.dpd_norm(torch.mm(Z, Z.transpose(0,1))))        
-        #get reconstructed adjacency
-        X_hat, A, decoder_attention_weights = self.decoder(Z, A)
-        
-        #bottom up method
+        forward_timing['dot_product'] += time.perf_counter() - _t0
+
+        # get reconstructed adjacency
+        _t0 = time.perf_counter()
+        X_hat, A, decoder_attention_weights = self.decoder(Z, A, ei=ei, ea=ea)
+        forward_timing['gate_decoder'] += time.perf_counter() - _t0
+
+        _t_clust = time.perf_counter()
+        # bottom up method
         if self.method == 'bottom_up':
             subsets_X = []
             subsets_A = []
             if self.use_output_layers:
-                #Output learning layers:
+                # Output learning layers
+                _t0 = time.perf_counter()
                 W = self.fully_connected_layers(Z)
-            
-                #fit hierarchy
-                X_top, A_top, X_all, A_all, P_all, S_all = self.commModule(W, A)
+                forward_timing['output_layers'] += time.perf_counter() - _t0
+
+                # fit hierarchy
+                _t0 = time.perf_counter()
+                X_top, A_top, X_all, A_all, P_all, S_all = self.commModule(W, A, ei=ei, ea=ea)
+                forward_timing['top_comm'] += time.perf_counter() - _t0
             else:
-                X_top, A_top, X_all, A_all, P_all, S_all = self.commModule(Z, A)
-                
-        
-        #top down method
+                _t0 = time.perf_counter()
+                X_top, A_top, X_all, A_all, P_all, S_all = self.commModule(Z, A, ei=ei, ea=ea)
+                forward_timing['top_comm'] += time.perf_counter() - _t0
+
+        # top down method
         if self.method == 'top_down':
-                #fit hierarchy
-                
-                #Get initial set of labels S - a list with one element (a tensor of class labels)
+                # fit hierarchy
+
+                # Get initial set of labels S - a list with one element (a tensor of class labels)
                 if self.use_kmeans_top:
-                    if self.use_output_layers: 
+                    if self.use_output_layers:
+                        _t0 = time.perf_counter()
                         W = self.fully_connected_layers(Z)
+                        forward_timing['output_layers'] += time.perf_counter() - _t0
+                        _t0 = time.perf_counter()
                         result = self.TopCommModule(W.unsqueeze(0))
+                        forward_timing['top_comm'] += time.perf_counter() - _t0
                     else:
+                        _t0 = time.perf_counter()
                         result = self.TopCommModule(Z.unsqueeze(0))
+                        forward_timing['top_comm'] += time.perf_counter() - _t0
                     S = [result.labels.squeeze(0)]
                     P = result.soft_assignment.squeeze(0)
                 else:
                     if self.use_output_layers:
-                        #Output learning layers:
+                        # Output learning layers
+                        _t0 = time.perf_counter()
                         W = self.fully_connected_layers(Z)
-                        X_top, A_top, X_all, A_all, P_all, S = self.TopCommModule(W, A)
+                        forward_timing['output_layers'] += time.perf_counter() - _t0
+                        _t0 = time.perf_counter()
+                        X_top, A_top, X_all, A_all, P_all, S = self.TopCommModule(W, A, ei=ei, ea=ea)
+                        forward_timing['top_comm'] += time.perf_counter() - _t0
                     else:
-                        X_top, A_top, X_all, A_all, P_all, S = self.TopCommModule(Z, A)
-                        
+                        _t0 = time.perf_counter()
+                        X_top, A_top, X_all, A_all, P_all, S = self.TopCommModule(Z, A, ei=ei, ea=ea)
+                        forward_timing['top_comm'] += time.perf_counter() - _t0
+
                     P = P_all[0]
-                 
-                
-                #Select data based on top partition i.e S
+
+
+                # Select data based on top partition i.e S
+                _t0 = time.perf_counter()
                 if self.use_output_layers:
                     subsets_with_index = [select_class(W, S[0], k, dim=0, return_index=True) for k in torch.unique(S[0])]
-                    
                 else:
                     subsets_with_index = [select_class(Z, S[0], k, dim=0, return_index=True) for k in torch.unique(S[0])]
-                    
-                    
-                #print(f'indices {[i[1] for i in subsets_with_index]}')
-                #positions = torch.cat([i[1] for i in subsets_with_index])
                 subsets_Z = [i[0] for i in subsets_with_index]
-                subsets_X = [select_class(X, S[0], k, dim=0) for k in torch.unique(S[0])] 
+                subsets_X = [select_class(X, S[0], k, dim=0) for k in torch.unique(S[0])]
                 subsets_A = [select_subgraph(A, S[0], k) for k in torch.unique(S[0])]
-                
-                
+                forward_timing['select_subsets'] += time.perf_counter() - _t0
+
                 if len(self.comm_sizes) > 1:
                     if self.use_kmeans_middle:
-                        
+
                         # apply k softkmeans layers
+                        _t0 = time.perf_counter()
                         results = [self.MiddleModules[i](x = sub_Z.unsqueeze(0), k = min(sub_Z.shape[0], self.comm_sizes[1])) for idx, (i, sub_Z) in enumerate(zip(torch.unique(S[0]), subsets_Z)) if sub_Z.shape[0] > 1]
-                        
-                        #store results
+                        forward_timing['middle_comm'] += time.perf_counter() - _t0
+
+                        # store results
                         X_all = []
                         A_all = []
                         P_all = [P, [i.soft_assignment.squeeze(0) for i in results]]
                         S_temp = [i.labels.squeeze(0)+index*j for index, (i,j) in enumerate(zip(results, torch.arange(self.comm_sizes[0])[torch.unique(S[0])]))]
-                        #S_temp = [i.labels.squeeze(0) for index, (i,j) in enumerate(zip(results, torch.arange(self.comm_sizes[0])[torch.unique(S[0])]))]
                         S_final = reorganize_labels(S1 = S[0], S2_list= S_temp)
                         S_all = [S[0], S_final]
-                        
-                        
+
+
                     else:
-                        
+                        device = X.device
+                        for m in self.MiddleModules:
+                           m.to(device)
+                        device = Z.device
                         # apply k linear predictors
-                        results = [self.MiddleModules[i](sub_Z, sub_A) for idx, (i, sub_Z, sub_A) in enumerate(zip(torch.unique(S[0]), subsets_Z, subsets_A))]
-                        #results = [self.MiddleModules[i](sub_Z.unsqueeze(0)) for idx, (i, sub_Z) in enumerate(zip(torch.unique(S[0]), subsets_Z))]
-                    
-                        #store results
+                        _t0 = time.perf_counter()
+                        results = [self.MiddleModules[i.item()](sub_Z.to(device), sub_A.to(device)) for idx, (i, sub_Z, sub_A) in enumerate(zip(torch.unique(S[0]), subsets_Z, subsets_A))]
+                        forward_timing['middle_comm'] += time.perf_counter() - _t0
+
+                        # store results
                         X_all = [i[0] for i in results]
                         A_all = [i[1] for i in results]
                         P_all = [P, [i[4][0] for i in results]]
-                        #S_temp = [(i[5][0]+self.comm_sizes[1]+10) % 100 if index > 0 else i[5][0] for index, (i,j) in enumerate(zip(results, torch.arange(0, self.comm_sizes[0])[torch.unique(S[0])])) ]
                         S_temp = [i[5][0]+((self.comm_sizes[1]+10)*index) for index, i in enumerate(results) ]
-                        #S_temp = [i[5][0] for index, i in enumerate(results) ]
                         S_final = reorganize_labels(S1 = S[0], S2_list= S_temp)
                         S_all = [S[0], S_final]
-                
+
+        forward_timing['clustering'] += time.perf_counter() - _t_clust
+        forward_timing['total_forward'] += time.perf_counter() - _t_forward
+        forward_timing['calls'] += 1
+
         A_all_final = [A]+[A_all]+[subsets_A]
         X_all_final = [Z]+[X_all]+[subsets_X]
         return X_hat, A_hat, A_logits, X_all_final, A_all_final, P_all, S_all, {'encoder': [[i.cpu() for i in j] for j in encoder_attention_weights], 'decoder': [[i.cpu() for i in j] for j in decoder_attention_weights]}
@@ -447,4 +528,3 @@ class HCD(nn.Module):
                 for i in range(self.comm_sizes[0]):
                     print(f'COMMUNITY {i} MODEL: \n')
                     summary(self.MiddleModules[i])
-    

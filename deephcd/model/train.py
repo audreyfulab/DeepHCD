@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 import numpy as np
 import time
-import torch.optim as optimizers 
+import torch.optim as optimizers
+from torch_geometric.utils import dense_to_sparse
 from deephcd.utils.utilities import logging_config, trace_comms
+from deephcd.model.model import forward_timing
 from deephcd.utils.train_utils import get_batch_data, get_efficient_batches, evaluate, memory_efficient_context, load_batch_output, modularity, wcss
 import os
 from typing import Optional, Union, List, Literal, Dict, Any, Tuple
@@ -58,7 +60,7 @@ class EarlyStopping:
     >>> stopper = EarlyStopping(patience=5, delta=0.01, verbose=True)
     >>> for epoch in range(100):
     ...     val_loss = validate(model)
-    ...     stopper(val_loss, model, _type='test')
+    ...     stopper(val_loss, model, _type='validation')
     ...     if stopper.early_stop:
     ...         print("Early stopping triggered.")
     ...         break
@@ -73,7 +75,7 @@ class EarlyStopping:
         self.delta = delta
         self.path = path if path else os.getcwd()
 
-    def __call__(self, loss: float | torch.Tensor | np.ndarray, model: nn.Module, _type: Optional[Literal['test', 'total']]):
+    def __call__(self, loss: float | torch.Tensor | np.ndarray, model: nn.Module, _type: Optional[Literal['validation', 'total']]):
         """Evaluates the current loss and decide whether to continue training.
 
         Parameters
@@ -82,7 +84,7 @@ class EarlyStopping:
             Current loss value to monitor for improvement.
         model : nn.Module
             PyTorch model being trained. A checkpoint is saved if the loss improves.
-        _type : {'test', 'total'}, optional
+        _type : {'validation', 'total'}, optional
             Label indicating the type of loss being monitored; used only for display/logging.
 
         Returns
@@ -148,15 +150,15 @@ class HCD_output:
         Input feature matrix used during training.
     A : torch.Tensor
         Input adjacency matrix representing graph structure.
-    test_set : tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
-        Optional test set containing `(X_test, A_test, labels_test)`.
+    validation_set : tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        Optional validation set containing `(X_val, A_val, labels_val)`.
     labels : torch.Tensor | np.ndarray
         Labels for the training samples.
     model_output : tuple
         Model output tuple containing:
         `(X_final, A_final, _, X_all_final, A_all_final, P_all_final, S_final, AW_final)`.
-    test_history : list[float]
-        Recorded loss values from test epochs.
+    validation_history : list[float]
+        Recorded loss values from validation epochs.
     train_history : list[float]
         Recorded loss values from training epochs.
     perf_history : list[Any]
@@ -180,7 +182,7 @@ class HCD_output:
         Partitioned feature tensors for subgraphs.
     attention_weights : dict[str, list[list[torch.Tensor]]] | None
         Nested attention weights detached from GPU memory.
-    train_loss_history, test_loss_history, performance_history, pred_history : list
+    train_loss_history, validation_loss_history, performance_history, pred_history : list
         Historical metrics from model training.
     probabilities : dict[str, Any]
         Hierarchical prediction probabilities at top and intermediate levels.
@@ -209,16 +211,16 @@ class HCD_output:
         Display the performance summary table if available.
     """
 
-    
+
     def __init__(self,
         X: torch.Tensor,
         A: torch.Tensor,
-        test_set: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        validation_set: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         labels: Union[torch.Tensor, np.ndarray],
         model_output: tuple[
             torch.Tensor, torch.Tensor, Any, tuple, tuple, tuple, tuple, Optional[dict[str, list[list[torch.Tensor]]]]
         ],
-        test_history: list[torch.Tensor | np.ndarray],
+        validation_history: list[torch.Tensor | np.ndarray],
         train_history: list[torch.Tensor | np.ndarray],
         perf_history: list[torch.Tensor | np.ndarray],
         pred_history: list[torch.Tensor | np.ndarray],
@@ -227,7 +229,7 @@ class HCD_output:
         
         # Store only essential data, move to CPU immediately
         X_final, A_final, _, X_all_final, A_all_final, P_all_final, S_final, AW_final = model_output
-        eval_X, eval_A, eval_labels = test_set if test_set else (None, None, None)
+        eval_X, eval_A, eval_labels = validation_set if validation_set else (None, None, None)
 
         self.model_output_history = [
             (X_final, A_final, X_all_final, A_all_final, P_all_final, S_final, AW_final)
@@ -250,7 +252,7 @@ class HCD_output:
         
         # Store histories (these are small)
         self.train_loss_history = train_history
-        self.test_loss_history = test_history
+        self.validation_loss_history = validation_history
         self.performance_history = perf_history
         self.pred_history = pred_history
         
@@ -261,14 +263,14 @@ class HCD_output:
             'labels_train': labels
         }
         
-        if test_set:
-            self.test_data = {
-                'X_test': eval_X.detach().cpu() if eval_X is not None else None,
-                'A_test': eval_A.detach().cpu() if eval_A is not None else None,
-                'labels_test': eval_labels
+        if validation_set:
+            self.validation_data = {
+                'X_val': eval_X.detach().cpu() if eval_X is not None else None,
+                'A_val': eval_A.detach().cpu() if eval_A is not None else None,
+                'labels_val': eval_labels
             }
         else:
-            self.test_data = {'X_test': None, 'A_test': None, 'labels_test': None}
+            self.validation_data = {'X_val': None, 'A_val': None, 'labels_val': None}
             
         self.probabilities = {
             'top': P_all_final[0].detach().cpu(),
@@ -326,15 +328,13 @@ class OptimizedModularityLoss(nn.Module):
     def forward(self, all_A, all_P, resolutions=None):
         loss = 0.0
         loss_list = []
-        
+    
         for index, (A, P) in enumerate(zip(all_A, all_P)):
-            resolution = resolutions[index] if resolutions else 1.0
-            
-            with memory_efficient_context():
-                mod = modularity(A, P, resolution)
-                loss += mod
-                loss_list.append(float(mod.detach().cpu().numpy()))
-                
+            resolution = resolutions[index] if (resolutions and index < len(resolutions)) else 1.0
+            mod = modularity(A, P, resolution)
+            loss += mod
+            loss_list.append(float(mod.detach().cpu().numpy()))
+
         return loss, loss_list
 
 
@@ -355,22 +355,33 @@ class OptimizedClusterLoss(nn.Module):
             
         for idx, P in enumerate(Probabilities):
             Attr = Attributes[idx] if isinstance(Attributes, list) else Attributes
-            
+
             if method == 'bottom_up':
                 ptensor_list.append(P)
             else:
                 ptensor_list = P
-                
-            with memory_efficient_context():
-                within_ss, centroids = wcss(X=Attr, Plist=ptensor_list, method=method)
-                
-                weight = Lamb[idx] if isinstance(Lamb, list) else Lamb
-                weighted_loss = weight * within_ss
-                
-                loss_list.append(float(weighted_loss.detach().cpu().numpy()))
-                loss += weighted_loss
+
+            within_ss, centroids = wcss(X=Attr, Plist=ptensor_list, method=method)
+
+            weight = Lamb[idx] if isinstance(Lamb, list) else Lamb
+            weighted_loss = weight * within_ss
+
+            loss_list.append(float(weighted_loss.detach().cpu().numpy()))
+            loss += weighted_loss
 
         return loss, loss_list
+
+
+# ======================================================================================
+# Nonzero-masked MSE loss
+# ======================================================================================
+def masked_mse_loss(X_hat: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+    """MSE computed only over entries where X is nonzero.
+    Falls back to zero loss if all entries are zero (avoids division by zero)."""
+    mask = X != 0
+    if mask.sum() == 0:
+        return torch.tensor(0.0, device=X.device, requires_grad=True)
+    return ((X_hat - X) ** 2)[mask].mean()
 
 
 # training function
@@ -423,8 +434,6 @@ class Trainer():
         Whether to disable the loss term related to adjacency matrix reconstruction.
     validation_data : tuple, optional (default=None)
         Validation dataset provided as (X_val, A_val, val_labels).
-    test_data : tuple, optional (default=None)
-        Test dataset provided as (X_test, A_test, test_labels).
     save_output : bool, optional (default=False)
         Whether to save the model's outputs and training history.
     output_path : str, optional (default='')
@@ -453,13 +462,13 @@ class Trainer():
         - `all_model_output`: List of all model outputs over training.
         - `attention_weights`: Attention weights from the final model.
         - `train_loss_history`: History of training losses.
-        - `test_loss_history`: History of test losses.
+        - `validation_loss_history`: History of validation losses.
         - `performance_history`: Performance metrics over epochs.
         - `latent_features`: Extracted latent feature representations.
         - `partitioned_data`: Data after partitioning into hierarchical clusters.
         - `partitioned_latent_features`: Partitioned latent features at different levels.
         - `training_data`: Dictionary containing training feature matrix and adjacency matrix.
-        - `test_data`: Dictionary containing test feature matrix and adjacency matrix.
+        - `validation_data`: Dictionary containing validation feature matrix and adjacency matrix.
         - `probabilities`: Cluster membership probabilities at different hierarchy levels.
         - `pred_history`: Predicted cluster assignments over epochs.
         - `adjacency`: Graph adjacency structures at different clustering levels.
@@ -468,7 +477,7 @@ class Trainer():
 
     Notes:
     ------
-    - Supports early stopping based on total loss or test loss.
+    - Supports early stopping based on total loss or validation loss.
     - Supports unsupervised learning based on total loss supervised learning based on validation loss when labels are provided.
     - Batch learning is enabled by default but can be disabled for full-batch training.
 
@@ -492,24 +501,24 @@ class Trainer():
                 epochs: Optional[int]=50, 
                 update_interval: Optional[int]=10, 
                 learning_rate: Optional[float]=1e-4, 
-                gamma: Optional[int]=1, 
-                delta: Optional[int]=1, 
-                _lambda: Optional[int]=1, 
-                graph_resolutions: Optional[List[int,int,]]=[1,1], 
+                gamma: Optional[int]=4,
+                delta: Optional[int]=10,
+                _lambda: Optional[int | List[int]]=[1/60, 1/20],
+                graph_resolutions: Optional[List[int]]=[1,1], 
                 k: Optional[int]=2,  
                 batch_size: Optional[int]=64, 
                 early_stopping: Optional[bool]=False, 
                 patience: Optional[int]=5, 
                 use_batch_learning: Optional[bool]=True,
-                true_labels: List[str | int] | np.ndarray | torch.Tensor=None, 
-                validation_data: Optional[Dict[str, torch.Tensor]]=None, 
-                test_data: Optional[Dict[str, torch.Tensor]]=None, 
+                true_labels: List[str | int] | np.ndarray | torch.Tensor=None,
+                validation_data: Optional[Dict[str, torch.Tensor]]=None,
                 save_output: Optional[bool]=False, 
                 output_path: Optional[str]=None, 
                 use_logging: Optional[bool]=True,
                 log_to_file: Optional[bool]=True,
                 loglevel: Optional[str]='INFO',
-                verbose: Optional[bool]=True, 
+                verbose: Optional[bool]=True,
+                use_masked_mse: Optional[bool]=True,
                 ):
         """
         Initializes the Trainer class with optional configurations.
@@ -526,7 +535,6 @@ class Trainer():
         self.A = A
         self.true_labels = true_labels
         self.validation_data = validation_data
-        self.test_data = test_data
 
         # Training hyperparameters
         self.optimizer_type = optimizer
@@ -546,10 +554,13 @@ class Trainer():
         self.save_output = save_output
         self.output_path = output_path
         self.verbose = verbose
+        self.use_masked_mse = use_masked_mse
         
         #set up logger
+
         if use_logging:
             if log_to_file:
+                os.makedirs(output_path, exist_ok=True)
                 logpath = os.path.join(output_path, 'logfile.txt')
             try:
                 self.logger = logging_config(logger_name="trainer",
@@ -577,7 +588,7 @@ class Trainer():
 
         # Initialize memory-efficient histories (stored on CPU only)
         self.train_loss_history: List[Dict[str, float]] = []
-        self.test_loss_history: List[Dict[str, float]] = []
+        self.val_loss_history: List[Dict[str, float]] = []
         self.performance_history: List[Optional[List]] = []
         self.pred_history: List[Optional[List]] = []
 
@@ -594,7 +605,7 @@ class Trainer():
                 print(_string)
                 
     #wrapper for printing performances
-    def print_performance(self, history: Dict, comm_layers: List[torch.Tensor | np.ndarray], k: int):
+    def print_performance(self, history: Dict, comm_layers: int, k: int):
         """bulk printing with error handling"""
         
         if not history or all(h is None for h in history):
@@ -624,13 +635,13 @@ class Trainer():
             self.logprint('-' * 50)
             
     @staticmethod
-    def get_mod_clust_losses(model: nn.Module, 
-                             Xbatch: torch.Tensor, 
-                             Abatch: torch.Tensor, 
-                             output: List | Tuple, 
-                             lamb: float | int | torch.Tensor, 
-                             resolution: List[float | int], 
-                             modlossfn: nn.Module, 
+    def get_mod_clust_losses(model: nn.Module,
+                             Xbatch: torch.Tensor,
+                             Abatch: torch.Tensor,
+                             output: List | Tuple,
+                             lamb: float | int | List[int | float] | torch.Tensor,
+                             resolution: List[float | int],
+                             modlossfn: nn.Module,
                              clustlossfn: nn.Module
                              ):
         
@@ -647,9 +658,13 @@ class Trainer():
             middle_mod_loss, values_mid = modlossfn(A_all[-1], P_all[1], resolution)
             Mod_loss = top_mod_loss + middle_mod_loss
             Modloss_values = values_top + [torch.mean(torch.tensor(values_mid)).item()]
-            
-            Clust_loss_top, Clustloss_values_top = clustlossfn(lamb[0], Xbatch, [P_all[0]], model.method)
-            Clust_loss_mid, Clustloss_values_mid = clustlossfn(lamb[1], X_all[-1], P_all[1], model.method)
+
+            # Handle lamb as list or scalar
+            lamb_top = lamb[0] if isinstance(lamb, (list, tuple)) else lamb
+            lamb_mid = lamb[1] if isinstance(lamb, (list, tuple)) and len(lamb) > 1 else lamb
+
+            Clust_loss_top, Clustloss_values_top = clustlossfn(lamb_top, Xbatch, [P_all[0]], model.method)
+            Clust_loss_mid, Clustloss_values_mid = clustlossfn(lamb_mid, X_all[-1], P_all[1], model.method)
             Clust_loss = Clust_loss_top + Clust_loss_mid
             Clustloss_values = Clustloss_values_top + [torch.sum(torch.tensor(Clustloss_values_mid)).item()]
         
@@ -668,14 +683,14 @@ class Trainer():
         train_loss_history = []
         perf_hist = []
         pred_list = []
-        test_loss_history = []
+        val_loss_history = []
         
         comm_layers = len(model.comm_sizes)
         
         # Early stopping
         if self.early_stopping:
-            early_stop = EarlyStopping(patience=self.patience, 
-                                       verbose=True, 
+            early_stop = EarlyStopping(patience=self.patience,
+                                       verbose=True,
                                        path=self.output_path)
         
         # Optimizer
@@ -684,8 +699,10 @@ class Trainer():
                                     weight_decay=self.optimizer_weight_decay)
         
         # Loss functions
-        A_recon_loss = nn.BCELoss(reduction='mean')
-        X_recon_loss = nn.MSELoss(reduction='mean')
+        A_recon_loss = nn.BCEWithLogitsLoss(reduction='mean')
+        x_loss_fn = masked_mse_loss if self.use_masked_mse else (
+            lambda yhat, y: nn.functional.mse_loss(yhat, y)
+        )
         modularity_loss_fn = OptimizedModularityLoss()
         clustering_loss_fn = OptimizedClusterLoss()
         
@@ -693,7 +710,7 @@ class Trainer():
         if self.use_batch_learning:
             if self.batch_size > self.X.shape[0]:
                 raise ValueError(f'Batch size ({self.batch_size}) larger than dataset size ({self.X.shape[0]})')
-            self.batch_indices_list = get_efficient_batches(self.X, self.A, self.batch_size, device='cpu')
+            self.batch_indices_list = get_efficient_batches(self.X, self.batch_size, device='cpu')
         else:
             self.batch_indices_list = [torch.arange(self.X.shape[0])]
         
@@ -717,42 +734,72 @@ class Trainer():
             
             # Batch processing with memory management
             for batch_idx, batch_indices in enumerate(self.batch_indices_list):
-                
-                
+
+
                 with memory_efficient_context():
                     # Get batch data on device
+                    _t0 = time.perf_counter()
                     X_batch, A_batch = get_batch_data(self.X, self.A, batch_indices, device)
-                    
+
+                    # Pre-compute sparse edge_index once — avoids 3-5x redundant
+                    # dense_to_sparse calls inside encoder, decoder, and community layers
+                    ei_batch, ea_batch = dense_to_sparse(A_batch)
+
                     optimizer.zero_grad()
-                    
+                    forward_timing['batch_prep'] += time.perf_counter() - _t0
+
                     # Forward pass
-                    forward_output = model.forward(X_batch, A_batch)
+                    forward_output = model.forward(X_batch, A_batch, ei=ei_batch, ea=ea_batch)
                     X_hat, A_hat, A_logit, X_all, A_all, P_all, S_all, AW = forward_output
+
+                    P_all = [
+                       p.to(X_batch.device) if torch.is_tensor(p)
+                       else [q.to(X_batch.device) for q in p]
+                       for p in P_all]
                     
                     # Compute losses efficiently
+                    _t0 = time.perf_counter()
                     mod_clust_output = self.get_mod_clust_losses(
-                        model, X_batch, A_batch, forward_output, self._lambda, 
+                        model, X_batch, A_batch, forward_output, self._lambda,
                         self.graph_resolutions, modularity_loss_fn, clustering_loss_fn
                     )
                     Mod_loss, Modloss_values, Clust_loss, Clustloss_values = mod_clust_output
-                    
-                    
+
                     # Reconstruction losses
-                    A_hat = torch.clamp(A_hat, min=1e-7, max=1 - 1e-7)
-                    X_loss = X_recon_loss(X_hat, X_batch)
-                    A_loss = A_recon_loss(A_hat, A_batch)
-                    
+                    X_loss = x_loss_fn(X_hat, X_batch)
+                    A_loss = A_recon_loss(A_logit, A_batch)  # Use logits for numerical stability
+
                     # Total loss
                     batch_loss = A_loss + self.gamma * X_loss + Clust_loss - self.delta * Mod_loss
-                    self.logprint(f'A_loss: {A_loss} X_loss: {X_loss} Clust_loss: {Clust_loss} Mod_loss: {Mod_loss}')
+                    forward_timing['loss_compute'] += time.perf_counter() - _t0
+                    A_v = A_loss.item()
+                    X_v = X_loss.item()
+                    C_v = Clust_loss.item() if torch.is_tensor(Clust_loss) else float(Clust_loss)
+                    M_v = Mod_loss.item()   if torch.is_tensor(Mod_loss)   else float(Mod_loss)
+                    gX = self.gamma * X_v
+                    dM = self.delta * M_v
+                    self.logprint(
+                        f'A_loss={A_v:.4f}  gamma*X_loss={gX:.4f} (X={X_v:.4f}, gamma={self.gamma})  '
+                        f'Clust_loss={C_v:.4f}  delta*Mod_loss={dM:.4f} (Mod={M_v:.4f}, delta={self.delta})  '
+                        f'=> batch_loss={A_v + gX + C_v - dM:.4f}'
+                    )
+
                     # Backward pass
+                    _t0 = time.perf_counter()
                     batch_loss.backward()
+                    forward_timing['backward'] += time.perf_counter() - _t0
+
+                    _t0 = time.perf_counter()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    forward_timing['grad_clip'] += time.perf_counter() - _t0
+
+                    _t0 = time.perf_counter()
                     optimizer.step()
+                    forward_timing['optimizer_step'] += time.perf_counter() - _t0
                     
                     # Update epoch losses
                     total_loss += batch_loss.item()
-                    self.logprint(f'batch loss: ',batch_loss.item())
+                    self.logprint(f'[Train] Epoch {epoch + 1} Batch {batch_idx + 1}/{len(self.batch_indices_list)} loss: {batch_loss.item():.6f}')
                     train_epoch_losses['A'] += A_loss.item()
                     train_epoch_losses['X'] += X_loss.item()
                     
@@ -762,72 +809,151 @@ class Trainer():
                             train_epoch_losses['mod'][i] += m
                     
                     # Clear batch data from GPU
-                    del X_batch, A_batch, forward_output
+                    _t0 = time.perf_counter()
+                    del X_batch, A_batch, ei_batch, ea_batch, forward_output
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                    forward_timing['gpu_cleanup'] += time.perf_counter() - _t0
             
+            # Average training losses across batches so they're on the same
+            # per-pass scale as the validation losses computed below.
+            n_batches = len(self.batch_indices_list)
+            denom = n_batches if n_batches > 0 else 1
+            avg_total_loss = total_loss / denom
+            avg_A = train_epoch_losses['A'] / denom
+            avg_X = train_epoch_losses['X'] / denom
+            avg_mod = np.array(train_epoch_losses['mod']) / denom
+            avg_clust = np.array(train_epoch_losses['clust']) / denom
+
             # Store training history
             train_loss_history.append({
-                'Total Loss': total_loss,
-                'A Reconstruction': train_epoch_losses['A'],
-                'X Reconstruction': self.gamma * train_epoch_losses['X'],
-                'Modularity': self.delta * np.array(train_epoch_losses['mod']),
-                'Clustering': np.array(train_epoch_losses['clust'])
+                'Total Loss': avg_total_loss,
+                'A Reconstruction': avg_A,
+                'X Reconstruction': self.gamma * avg_X,
+                'Modularity': self.delta * avg_mod,
+                'Clustering': avg_clust
             })
             
             # Evaluation (less frequent to save memory)
-            test_loss = 0.0
-            if self.test_data:
-                eval_X, eval_A, eval_labels = self.test_data
+            val_loss = 0.0
+            A_loss_val = 0.0
+            X_loss_val = 0.0
+            Mod_loss_val_item = 0.0
+            Clust_loss_val_item = 0.0
+            Modloss_values_val = [0.0] * len(model.comm_sizes)
+            Clustloss_values_val = [0.0] * len(model.comm_sizes)
+            if self.validation_data:
+                eval_X, eval_A, eval_labels = self.validation_data
+                _t0 = time.perf_counter()
                 with memory_efficient_context():
-                    test_perf, test_output, S_replab_test = evaluate(
+                    val_perf, val_output, S_replab_val = evaluate(
                         model, eval_X, eval_A, self.k, eval_labels, device=device
                     )
-                    
-                    if test_output[0] is not None:
-                        X_hat_test, A_hat_test = test_output[0], test_output[1]
+
+                    if val_output[0] is not None:
+                        X_hat_val = val_output[0]
                         eval_X_dev = eval_X.to(device)
                         eval_A_dev = eval_A.to(device)
-                        X_hat_dev = X_hat_test.to(device)
-                        A_hat_dev = A_hat_test.to(device)
-                        
-                        X_loss_test = X_recon_loss(X_hat_dev, eval_X_dev).item()
-                        A_loss_test = A_recon_loss(A_hat_dev, eval_A_dev).item()
-                        test_loss = A_loss_test + self.gamma * X_loss_test
-                        
-            
-            test_loss_history.append({'Total Loss': test_loss})
+                        X_hat_dev = X_hat_val.to(device)
+
+                        # Recompute forward pass to obtain raw A logits (index 2),
+                        # matching the training-side BCEWithLogitsLoss input.
+                        model.eval()
+                        with torch.no_grad():
+                            val_forward = model.forward(eval_X_dev, eval_A_dev)
+                        A_logit_dev = val_forward[2].to(device)
+
+                        # Modularity + clustering losses on the validation forward output
+                        val_X_hat, val_A_hat, val_A_logit, val_X_all, val_A_all, val_P_all, val_S_all, val_AW = val_forward
+                        val_P_all = [
+                            p.to(device) if torch.is_tensor(p)
+                            else [q.to(device) for q in p]
+                            for p in val_P_all
+                        ]
+                        val_forward_on_device = (
+                            val_X_hat, val_A_hat, val_A_logit,
+                            val_X_all, val_A_all, val_P_all, val_S_all, val_AW
+                        )
+                        with torch.no_grad():
+                            Mod_loss_val, Modloss_values_val, Clust_loss_val, Clustloss_values_val = self.get_mod_clust_losses(
+                                model, eval_X_dev, eval_A_dev, val_forward_on_device,
+                                self._lambda, self.graph_resolutions,
+                                modularity_loss_fn, clustering_loss_fn
+                            )
+                        Mod_loss_val_item = Mod_loss_val.item() if torch.is_tensor(Mod_loss_val) else float(Mod_loss_val)
+                        Clust_loss_val_item = Clust_loss_val.item() if torch.is_tensor(Clust_loss_val) else float(Clust_loss_val)
+
+                        # Per-batch validation loss (using same batch_size as training)
+                        n_val = eval_X_dev.shape[0]
+                        if self.use_batch_learning:
+                            val_bs = min(self.batch_size, n_val)
+                            val_batches = [torch.arange(i, min(i + val_bs, n_val))
+                                           for i in range(0, n_val, val_bs)]
+                        else:
+                            val_batches = [torch.arange(n_val)]
+
+                        for vb_idx, vb in enumerate(val_batches):
+                            X_loss_vb = x_loss_fn(X_hat_dev[vb], eval_X_dev[vb]).item()
+                            A_loss_vb = A_recon_loss(A_logit_dev[vb][:, vb], eval_A_dev[vb][:, vb]).item()
+                            vb_loss = A_loss_vb + self.gamma * X_loss_vb
+                            self.logprint(f'[Val]   Epoch {epoch + 1} Batch {vb_idx + 1}/{len(val_batches)} loss: {vb_loss:.6f}')
+
+                        X_loss_val = x_loss_fn(X_hat_dev, eval_X_dev).item()
+                        A_loss_val = A_recon_loss(A_logit_dev, eval_A_dev).item()
+                        val_loss = (
+                            A_loss_val
+                            + self.gamma * X_loss_val
+                            + Clust_loss_val_item
+                            - self.delta * Mod_loss_val_item
+                        )
+                forward_timing['validation'] += time.perf_counter() - _t0
+
+
+            if self.validation_data:
+                val_loss_history.append({
+                    'Total Loss': val_loss,
+                    'A Reconstruction': A_loss_val,
+                    'X Reconstruction': self.gamma * X_loss_val,
+                    'Modularity': self.delta * np.array(Modloss_values_val),
+                    'Clustering': np.array(Clustloss_values_val),
+                })
             
             # Performance evaluation (periodic)
             if epoch % self.update_interval == 0:
+                _t0 = time.perf_counter()
                 with memory_efficient_context():
                     train_perf, eval_output, S_eval = evaluate(
                         model, self.X, self.A, self.k, self.true_labels, device=device
                     )
                     perf_hist.append(train_perf)
                     pred_list.append(S_eval)
-                    
+
                     if self.true_labels:
                         self.logprint('\nMODEL PERFORMANCE')
-                        self.print_performance(perf_hist, comm_layers, k)
+                        self.print_performance(perf_hist, comm_layers, self.k)
+                forward_timing['perf_eval'] += time.perf_counter() - _t0
             
             # Early stopping check
             if self.early_stopping:
                 self.logprint(f"""Early Stopping Start:
-                              A_loss_test: {A_loss_test} 
-                              X_loss_test: {X_loss_test}
-                              Total Loss: {total_loss}
-                              Test Loss: {test_loss}
+                              A_loss_val: {A_loss_val}
+                              X_loss_val: {X_loss_val}
+                              Avg Training Loss (per batch): {avg_total_loss}
+                              Validation Loss: {val_loss}
                               """)
-            
-                early_stop(test_loss if self.test_data else total_loss, model)
+                loss_value = val_loss if self.validation_data else avg_total_loss
+                loss_type = 'validation' if self.validation_data else 'total'
+                early_stop(loss_value, model, loss_type)
                 if early_stop.early_stop:
                     self.logprint("Early stopping triggered")
                     break
             
             epoch_time = time.time() - epoch_start
             if self.verbose:
-                self.logprint(f'Epoch {epoch + 1} completed in {epoch_time:.2f}s Total Loss: {total_loss:.4f}')
+                self.logprint(f'Epoch {epoch + 1} completed in {epoch_time:.2f}s')
+                self.logprint(f'  Avg Training Loss (per batch): {avg_total_loss:.6f}  (sum across {n_batches} batches: {total_loss:.6f})')
+                if self.validation_data:
+                    self.logprint(f'  Total Validation Loss: {val_loss:.6f}')
                 self.logprint('-' * 50)
         
         # Final model output
@@ -848,10 +974,10 @@ class Trainer():
         
         # Create output object
         output = HCD_output(
-            X=self.X, A=self.A, test_set=self.test_data, labels=self.true_labels,
+            X=self.X, A=self.A, validation_set=self.validation_data, labels=self.true_labels,
             model_output=final_out_cpu, train_history=train_loss_history,
-            test_history=test_loss_history, perf_history=perf_hist,
-            pred_history=pred_list, batch_indices=self.batch_indices_list, device='cpu'
+            validation_history=val_loss_history, perf_history=perf_hist,
+            pred_history=pred_list, batch_indices=self.batch_indices_list
         )
         
         return output

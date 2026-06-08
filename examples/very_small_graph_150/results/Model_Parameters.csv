@@ -1,0 +1,54 @@
+,Parameter,Value
+0,dataset,generated
+1,parent_distribution,
+2,read_from,local
+3,which_net,0
+4,use_true_graph,False
+5,correlation_cutoff,0.2
+6,use_method,top_down
+7,use_softKMeans_top,False
+8,use_softKMeans_middle,False
+9,gamma,2
+10,delta,10
+11,lambda_,"[0.016666666666666666, 0.05]"
+12,learning_rate,0.001
+13,dropout_rate,0.2
+14,use_batch_learning,True
+15,batch_size,64
+16,training_epochs,2
+17,steps_between_updates,10
+18,resolution,
+19,AE_hidden_size,"[256, 128]"
+20,LL_hidden_size,"[64, 64]"
+21,AE_operator,GATv2Conv
+22,COMM_operator,None
+23,use_true_communities,True
+24,community_sizes,"[15, 5]"
+25,activation,
+26,use_gpu,True
+27,verbose,False
+28,return_result,best_loss
+29,save_results,True
+30,set_seed,555
+31,seed,555
+32,sp,/Users/jordandavis/Desktop/HGRN_repo/very_small_graph_150/results/
+33,plotting_node_size,25
+34,fs,10
+35,run_louvain,True
+36,run_kmeans,True
+37,run_hc,True
+38,use_multihead_attn,True
+39,attn_heads,5
+40,normalize_layers,True
+41,normalize_input,True
+42,split_data,True
+43,early_stopping,True
+44,patience,10
+45,train_test_size,"[0.8, 0.2]"
+46,post_hoc_plots,True
+47,add_output_layers,False
+48,make_directories,True
+49,save_model,False
+50,compute_optimal_clusters,True
+51,kappa_method,bethe_hessian
+52,load_from_existing,True

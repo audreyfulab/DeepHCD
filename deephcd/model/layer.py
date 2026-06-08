@@ -296,37 +296,52 @@ class Comm_DenseLayer2(nn.Module):
     
     def forward(self, inputs):
         """
-        inputs: a list of size elements [Z, A, X_tilde, A_tilde, S] where 
+        inputs: a list of size elements [Z, A, X_tilde, A_tilde, S] where
                 Z: Node representations   N x q
                 A: Adjacency matrix   N x N
                 X_tilde: Centroid matrix   ki x q
                 A_tilde: graph for connected communities   ki x ki
                 S: predicted class labels   N x 1
+        Optional: inputs[6] = pre-computed edge_index, inputs[7] = edge_attr
+                  (valid only for this layer; cleared afterward so subsequent
+                  layers recompute from the coarsened A_tilde)
         """
         Z=inputs[0]
         A=inputs[1]
-        
+        ei_precomputed = inputs[6] if len(inputs) > 6 else None
+
         if self.operator.lower() == 'none':
-            
+
             H = self.transform(Z)
-        
+
         if self.operator.lower() in ['linear','conv1d']:
-            
+
             #linear layer and activation
             M = self.transform(Z)
             M_norm = self.out_norm(M)
             H = self.act(M_norm)
-            
+
         if self.operator.lower() in ['sageconv','gatconv','gatv2conv']:
-            
-            ei, ea = pyg_utils.dense_to_sparse(A)
+
+            if ei_precomputed is not None:
+                ei = ei_precomputed
+            else:
+                ei, _ = pyg_utils.dense_to_sparse(A)
             M = self.transform(x=Z, edge_index=ei)
             H = self.out_norm(M)
+
+        # Clear pre-computed ei so the next layer in the Sequential recomputes
+        # from A_tilde (which is a different, coarsened matrix after this layer).
+        if len(inputs) > 6:
+            inputs[6] = None
         
         # class prediction probabilities
+       
         OL = self.output_linear(H)
-        P = F.softmax(OL, dim = 1)
-        
+        OL = torch.clamp(OL, min=-10, max=10)
+        OL_stable = OL - OL.max(dim=1, keepdim=True)[0]  # Subtract max for stability
+        P = F.softmax(OL_stable, dim=1)
+
         #get the centroids and layer adjacency matrix
         X_tilde = torch.mm(torch.mm(Z.T, P), torch.diag(1/P.sum(dim = 0)+1e-8)).T
         

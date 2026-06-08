@@ -96,7 +96,7 @@ def compute_beth_hess_comms(A: torch.Tensor):
     avg_degree = torch.mm(torch.mm(torch.ones((N,1)).T, A), torch.ones((N, 1)))/N
     eta = torch.sqrt(avg_degree)
     Bethe_Hessian = (torch.square(eta)-1)*torch.diag(torch.ones(N))+Deg - eta*A
-    eigvals = torch.linalg.eigh(Bethe_Hessian)[0]
+    eigvals = torch.tensor(spy.linalg.eigvalsh(Bethe_Hessian.numpy()))
     k = torch.sum(eigvals<0)
     return int(k)
 
@@ -447,10 +447,10 @@ def sort_labels(labels):
 
 #----------------------------------------------------------------
 def LoadData(filename):
-    unparsed_labels = pd.read_csv(filename+'_gexp.csv', index_col=0).columns.tolist()
+    unparsed_labels = pd.read_csv(filename+'/_gexp.csv', index_col=0).columns.tolist()
     flat_list_indices, flat_list_indices2, new_true_labels, sorted_true_labels_top, sorted_true_labels_middle = sort_labels(unparsed_labels)
-    pe = np.load(filename+'_gexp.npy').transpose()
-    true_adj = build_true_graph(filename+'.npz')
+    pe = np.load(filename+'/_gexp.npy').transpose()
+    true_adj = build_true_graph(filename+'/.npz')
     G = nx.from_numpy_array(true_adj)
     G = G.to_undirected()
     true_adj_undi = nx.adjacency_matrix(G).toarray()
@@ -564,7 +564,12 @@ def get_input_graph(X = None, method = ['KNN','Presicion','Correlation', 'DAG-GN
     '''
     
     
-    
+    def fast_corr(X):
+        """X: genes × cells matrix"""
+        X = X - X.mean(axis=1, keepdims=True)
+        X /= np.linalg.norm(X, axis=1, keepdims=True)
+        return X @ X.T
+
     if method == 'KNN':
         if metric == '1-R^2':
             A = kneighbors_graph(X, n_neighbors = K, metric = corr_dist)
@@ -581,7 +586,7 @@ def get_input_graph(X = None, method = ['KNN','Presicion','Correlation', 'DAG-GN
         
     if method == 'Correlation':
         #get the absolute correlations
-        cormat = np.absolute(np.corrcoef(X))
+        cormat = np.absolute(fast_corr(X))
         A_adj = np.copy(cormat)
         A_adj[A_adj>r_cutoff] = 1
         A_adj[A_adj<=r_cutoff] = 0
